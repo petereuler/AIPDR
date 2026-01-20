@@ -198,6 +198,51 @@ def create_gray_code_table(num_bits):
     return bin_to_gray, gray_to_bin
 
 
+class RS51Codec:
+    """RS(5,1) over GF(2^m) reduces to symbol repetition (5 copies)."""
+    def __init__(self):
+        self.data_bits = None
+        self.code_bits = None
+
+    def configure(self, data_bits):
+        self.data_bits = data_bits
+        self.code_bits = data_bits * 5
+        return self
+
+    def encode(self, data_bits):
+        """
+        Args:
+            data_bits: np.ndarray, shape (N, K)
+        Returns:
+            code_bits: np.ndarray, shape (N, K*5)
+        """
+        n, k = data_bits.shape
+        if self.data_bits is None:
+            raise ValueError("RS51Codec must be configured with data_bits.")
+        if k != self.data_bits:
+            raise ValueError("RS(5,1) expects exactly one symbol.")
+        code = np.repeat(data_bits, 5, axis=1)
+        return code
+
+    def decode(self, code_bits, code_probs=None):
+        """
+        Args:
+            code_bits: np.ndarray, shape (N, M)
+            code_probs: np.ndarray or None, shape (N, M) with values in [0,1]
+        Returns:
+            data_bits: np.ndarray, shape (N, data_bits)
+        """
+        n, m = code_bits.shape
+        if self.data_bits is None:
+            raise ValueError("RS51Codec must be configured with data_bits.")
+        if m != self.code_bits:
+            raise ValueError("RS(5,1) expects exactly 5 symbols.")
+        bits = code_bits.reshape(n, 5, self.data_bits)
+        # majority vote per bit
+        majority = (bits.sum(axis=1) >= 3).astype(bits.dtype)
+        return majority
+
+
 
 
 # ==================== 航向角量化器 ====================
@@ -207,14 +252,21 @@ class HeadingQuantizer:
     航向角均匀量化器
     将连续的航向角（-π到π）均匀量化到离散的bin索引
     """
-    def __init__(self, num_bins=256, use_gray_code=True):
+    def __init__(self, num_bins=256, use_gray_code=True, use_rs=False):
         self.num_bins = num_bins
         self.num_bits = int(np.log2(num_bins))
         self.use_gray_code = use_gray_code
+        self.use_rs = use_rs
         self.adaptive = False  # HeadingQuantizer始终使用均匀量化
 
-        # 输出位数等于输入位数
-        self.code_bits = self.num_bits
+        # RS(5,1) block code (symbol repetition)
+        self.rs = RS51Codec().configure(self.num_bits) if self.use_rs else None
+
+        # 输出位数等于输入位数（无纠错）或扩展后的码长（纠错）
+        if self.use_rs:
+            self.code_bits = self.rs.code_bits
+        else:
+            self.code_bits = self.num_bits
 
         # 航向角范围：-π 到 π
         self.angle_range = 2 * np.pi
@@ -236,6 +288,12 @@ class HeadingQuantizer:
             # 对于标准二进制编码，预计算所有可能组合
             self.all_gray_codes = np.array([int_to_binary_array(i, self.num_bits)
                                            for i in range(self.num_bins)], dtype=np.float32)
+
+        # 如果启用纠错编码，预计算所有码字
+        if self.use_rs:
+            self.all_codewords = self.rs.encode(self.all_gray_codes.astype(np.int32)).astype(np.float32)
+        else:
+            self.all_codewords = self.all_gray_codes
 
         self.fitted = False
 
@@ -287,8 +345,17 @@ class HeadingQuantizer:
         """
         # 处理输入类型：转换为 numpy 数组（如果需要）
         if hasattr(binary_probs, 'cpu'):
-            # PyTorch 张量
             binary_probs = binary_probs.cpu().numpy()
+
+        if self.use_rs:
+            # MAP 码字解码：在所有合法码字中选择概率最大的 bin
+            probs = np.clip(binary_probs, 1e-8, 1 - 1e-8)
+            log_probs_1 = np.log(probs)[:, None, :]
+            log_probs_0 = np.log(1 - probs)[:, None, :]
+            codes = self.all_codewords.astype(np.float32)[None, :, :]
+            bin_log_probs = np.sum(codes * log_probs_1 + (1 - codes) * log_probs_0, axis=2)
+            bin_indices = np.argmax(bin_log_probs, axis=1)
+            return self.decode(bin_indices)
 
         # 将概率转换为二进制向量（阈值0.5）
         binary_vectors = (binary_probs >= 0.5).astype(int)
@@ -323,14 +390,14 @@ class HeadingQuantizer:
         probs = torch.sigmoid(logits)  # (batch_size, num_bits)
 
         # 获取所有可能的编码组合
-        all_codes = torch.tensor(self.all_gray_codes, device=device, dtype=torch.float32)  # (num_bins, num_bits)
+        all_codes = torch.tensor(self.all_codewords, device=device, dtype=torch.float32)  # (num_bins, code_bits)
 
         # 计算每个bin的log概率
         # P(Bin_i) = Product over bits: P(bit_j)^code_j * (1-P(bit_j))^(1-code_j)
         # 使用log概率避免数值下溢
 
-        log_probs_1 = torch.log(probs + 1e-8).unsqueeze(1)  # (batch_size, 1, num_bits)
-        log_probs_0 = torch.log(1 - probs + 1e-8).unsqueeze(1)  # (batch_size, 1, num_bits)
+        log_probs_1 = torch.log(probs + 1e-8).unsqueeze(1)  # (batch_size, 1, code_bits)
+        log_probs_0 = torch.log(1 - probs + 1e-8).unsqueeze(1)  # (batch_size, 1, code_bits)
         codes_expanded = all_codes.unsqueeze(0)  # (1, num_bins, num_bits)
 
         # 计算每个bin的log概率：sum over bits [code_j * log(P_1) + (1-code_j) * log(P_0)]
@@ -380,7 +447,12 @@ class HeadingQuantizer:
 
             binary_vectors.append(binary_vec)
 
-        return np.array(binary_vectors)
+        binary_vectors = np.array(binary_vectors)
+
+        if self.use_rs:
+            binary_vectors = self.rs.encode(binary_vectors.astype(np.int32))
+
+        return binary_vectors
 
     def get_soft_labels(self, heading_angles, sigma=0.1):
         """
@@ -394,6 +466,7 @@ class HeadingQuantizer:
         for i, bin_idx in enumerate(bin_indices):
             # 高斯分布生成软标签
             distances = np.abs(np.arange(self.num_bins) - bin_idx)
+            distances = np.minimum(distances, self.num_bins - distances)
             weights = np.exp(-distances ** 2 / (2 * sigma ** 2))
             weights /= weights.sum()  # 归一化
             soft_labels[i] = weights
@@ -407,6 +480,7 @@ class HeadingQuantizer:
             'num_bins': self.num_bins,
             'num_bits': self.num_bits,
             'use_gray_code': self.use_gray_code,
+            'use_rs': self.use_rs,
             'code_bits': self.code_bits,
             'angle_range': self.angle_range,
             'bin_width': self.bin_width,
@@ -432,6 +506,7 @@ class HeadingQuantizer:
             self.num_bins = int(state['num_bins'])
             self.num_bits = int(state['num_bits'])
             self.use_gray_code = bool(state['use_gray_code'])
+            self.use_rs = bool(state.get('use_rs', False))
             self.code_bits = int(state['code_bits'])
             self.angle_range = float(state['angle_range'])
             self.bin_width = float(state['bin_width'])
@@ -448,6 +523,13 @@ class HeadingQuantizer:
             else:
                 self.bin_to_gray = None
                 self.gray_to_bin = None
+
+            self.rs = RS51Codec().configure(self.num_bits) if self.use_rs else None
+
+            if self.use_rs:
+                self.all_codewords = self.rs.encode(self.all_gray_codes.astype(np.int32)).astype(np.float32)
+            else:
+                self.all_codewords = self.all_gray_codes
 
 # ==================== 航向角分类头 ====================
 
@@ -504,12 +586,15 @@ class HeadingBinaryHead(torch.nn.Module):
 
 
 class HeadingBinaryLoss(nn.Module):
-    """航向角二进制编码损失（支持汉明码）"""
-    def __init__(self, num_bits=8, use_gray_code=True, quantizer=None, circular_weight=0.1):
+    """航向角二进制编码损失（支持纠错码）"""
+    def __init__(self, num_bits=8, use_gray_code=True, quantizer=None, circular_weight=0.1, label_smoothing_sigma=0.0, code_constraint_weight=0.0, use_codeword_nll=False):
         super().__init__()
         self.num_bits = num_bits
         self.num_bins = 2 ** num_bits
         self.circular_weight = circular_weight  # 周期性几何约束权重
+        self.label_smoothing_sigma = label_smoothing_sigma  # >0 时启用 soft label
+        self.code_constraint_weight = code_constraint_weight  # RS一致性约束权重
+        self.use_codeword_nll = use_codeword_nll  # 码字级NLL损失
 
         if quantizer is not None:
             self.quantizer = quantizer
@@ -522,8 +607,8 @@ class HeadingBinaryLoss(nn.Module):
             self.output_bits = self.quantizer.code_bits
 
         # [优化] 预先将格雷码表转为 Tensor 并注册为 Buffer，避免每次 Forward 重复创建
-        all_codes = torch.tensor(self.quantizer.all_gray_codes, dtype=torch.float32)
-        self.register_buffer('all_gray_codes', all_codes)
+        all_codes = torch.tensor(self.quantizer.all_codewords, dtype=torch.float32)
+        self.register_buffer('all_codes', all_codes)
 
         # 同样预存角度中心，用于软解码
         bin_centers = torch.tensor(self.quantizer.bin_centers, dtype=torch.float32)
@@ -544,7 +629,7 @@ class HeadingBinaryLoss(nn.Module):
         log_probs_0 = torch.log(1 - probs + 1e-8).unsqueeze(1)
 
         # 确保 all_gray_codes 在正确的设备上
-        codes = self.all_gray_codes.to(device).unsqueeze(0)  # (1, num_bins, bits)
+        codes = self.all_codes.to(device).unsqueeze(0)  # (1, num_bins, bits)
 
         # sum over bits -> (batch_size, num_bins)
         bin_log_probs = torch.sum(
@@ -575,12 +660,55 @@ class HeadingBinaryLoss(nn.Module):
         """
         target_heading = target_heading.squeeze(-1)
 
-        # 获取目标编码
-        target_binary = self.quantizer.encode_to_binary_vector(target_heading.cpu().numpy())
-        target_binary = torch.tensor(target_binary, device=logits.device, dtype=torch.float32)
+        if self.label_smoothing_sigma and self.label_smoothing_sigma > 0:
+            soft_bins = self.quantizer.get_soft_labels(
+                target_heading.cpu().numpy(),
+                sigma=self.label_smoothing_sigma
+            )
+            soft_bins = torch.tensor(soft_bins, device=logits.device, dtype=torch.float32)
+            soft_target_bits = torch.matmul(soft_bins, self.all_codes.to(logits.device))
+            bce_loss = F.binary_cross_entropy_with_logits(logits, soft_target_bits, reduction='mean')
+        else:
+            # 获取目标编码
+            target_binary = self.quantizer.encode_to_binary_vector(target_heading.cpu().numpy())
+            target_binary = torch.tensor(target_binary, device=logits.device, dtype=torch.float32)
 
-        # 二进制交叉熵损失
-        bce_loss = F.binary_cross_entropy_with_logits(logits, target_binary, reduction='mean')
+            # 二进制交叉熵损失
+            bce_loss = F.binary_cross_entropy_with_logits(logits, target_binary, reduction='mean')
+
+        code_nll = torch.tensor(0.0, device=logits.device)
+        if self.use_codeword_nll:
+            probs = torch.sigmoid(logits)
+            codes = self.all_codes.to(logits.device)  # (num_bins, code_bits)
+            log_probs_1 = torch.log(probs + 1e-8).unsqueeze(1)  # (B, 1, bits)
+            log_probs_0 = torch.log(1 - probs + 1e-8).unsqueeze(1)
+            bin_log_probs = torch.sum(
+                codes.unsqueeze(0) * log_probs_1 + (1 - codes.unsqueeze(0)) * log_probs_0,
+                dim=2
+            )  # (B, num_bins)
+
+            # 目标bin索引
+            target_heading_np = target_heading.detach().cpu().numpy()
+            target_bins = self.quantizer.encode(target_heading_np)
+            target_bins = torch.tensor(target_bins, device=logits.device, dtype=torch.long)
+            code_nll = F.nll_loss(F.log_softmax(bin_log_probs, dim=1), target_bins, reduction='mean')
+
+            # 用码字级NLL替代逐bit BCE
+            bce_loss = code_nll
+
+        # RS(5,1)一致性约束损失（仅在启用纠错编码时）
+        code_loss = torch.tensor(0.0, device=logits.device)
+        if self.code_constraint_weight > 0 and self.quantizer.use_rs:
+            probs = torch.sigmoid(logits)
+            code_bits = probs.shape[1]
+            if code_bits % 5 != 0:
+                raise ValueError("RS(5,1) code length must be num_bits*5.")
+            blocks = probs.view(probs.shape[0], 5, -1)
+            p0, p1, p2, p3, p4 = [blocks[:, i, :] for i in range(5)]
+            code_loss = (torch.abs(p0 - p1) + torch.abs(p0 - p2) + torch.abs(p0 - p3) + torch.abs(p0 - p4) +
+                         torch.abs(p1 - p2) + torch.abs(p1 - p3) + torch.abs(p1 - p4) +
+                         torch.abs(p2 - p3) + torch.abs(p2 - p4) +
+                         torch.abs(p3 - p4)).mean()
 
         # 辅助损失：周期性几何约束 (针对 Angle)
         if self.circular_weight > 0:
@@ -594,13 +722,13 @@ class HeadingBinaryLoss(nn.Module):
             circular_loss = 1.0 - torch.cos(pred_angles_soft - target_heading)
             circular_loss = circular_loss.mean()
 
-            loss = bce_loss + self.circular_weight * circular_loss
+            loss = bce_loss + self.circular_weight * circular_loss + self.code_constraint_weight * code_loss
         else:
             circular_loss = torch.tensor(0.0, device=logits.device)
-            loss = bce_loss
+            loss = bce_loss + self.code_constraint_weight * code_loss
 
         if return_details:
-            return loss, {"bce": bce_loss.item(), "geo": circular_loss.item()}
+            return loss, {"bce": bce_loss.item(), "geo": circular_loss.item(), "code": code_loss.item()}
         else:
             return loss
 
@@ -627,7 +755,7 @@ def compute_bit_accuracy(logits, target_heading, quantizer):
 
     # 4. 计算完全匹配率 (Exact Match Ratio) - 即预测出了完全正确的Bin
     # 只有当一行中所有bit都对，才算对
-    row_correct = (correct_bits.sum(dim=1) == quantizer.num_bits).float()
+    row_correct = (correct_bits.sum(dim=1) == quantizer.code_bits).float()
     bin_acc = row_correct.mean().item()
 
     return {"bit_acc": bit_acc, "bin_acc": bin_acc}
@@ -639,7 +767,3 @@ def compute_heading_mae(pred_heading, target_heading):
     diff = pred_heading - target_heading
     diff = (diff + np.pi) % (2 * np.pi) - np.pi
     return torch.abs(diff).mean()
-
-
-
-

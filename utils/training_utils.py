@@ -44,10 +44,12 @@ def load_data_2d_oxiod(data_root, device, window_size=160, stride=32):
         os.path.join(data_root, 'handheld', 'data2', 'syn', 'imu3.csv'),
         os.path.join(data_root, 'handheld', 'data3', 'syn', 'imu2.csv'),
         os.path.join(data_root, 'handheld', 'data3', 'syn', 'imu3.csv'),
+        os.path.join(data_root, 'handheld', 'data3', 'syn', 'imu4.csv'),
         os.path.join(data_root, 'handheld', 'data3', 'syn', 'imu5.csv'),
         os.path.join(data_root, 'handheld', 'data4', 'syn', 'imu2.csv'),
         os.path.join(data_root, 'handheld', 'data4', 'syn', 'imu4.csv'),
         os.path.join(data_root, 'handheld', 'data4', 'syn', 'imu5.csv'),
+        os.path.join(data_root, 'handheld', 'data5', 'syn', 'imu1.csv'),
         os.path.join(data_root, 'handheld', 'data5', 'syn', 'imu2.csv'),
         os.path.join(data_root, 'handheld', 'data5', 'syn', 'imu4.csv'),
     ]
@@ -58,8 +60,7 @@ def load_data_2d_oxiod(data_root, device, window_size=160, stride=32):
         os.path.join(data_root, 'handheld', 'data2', 'syn', 'imu2.csv'),
         os.path.join(data_root, 'handheld', 'data3', 'syn', 'imu4.csv'),
         os.path.join(data_root, 'handheld', 'data4', 'syn', 'imu5.csv'),
-        os.path.join(data_root, 'handheld', 'data5', 'syn', 'imu3.csv'),
-        os.path.join(data_root, 'handheld', 'data3', 'syn', 'imu4.csv'),
+        os.path.join(data_root, 'handheld', 'data5', 'syn', 'imu1.csv'),
     ])
 
     xg_tr, xa_tr, yl_tr, yh_tr = [], [], [], []

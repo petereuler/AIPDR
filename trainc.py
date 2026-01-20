@@ -35,12 +35,16 @@ num_bits = 8  # 必须是 4 的倍数
 num_bins = 2 ** num_bits
 use_adaptive_quantization = False  # 启用自适应非均匀量化
 # 计算输出位数
-output_bits = num_bits
+use_rs = True  # 启用 RS(5,1) 纠错编码（符号重复）
+output_bits = num_bits * 5
+label_smoothing_sigma = 0.0  # >0 启用 soft-label，单位为 bin
+code_constraint_weight = 0.3  # RS一致性约束权重（仅在 use_rs=True 时生效）
+use_codeword_nll = True  # 码字级NLL损失（优先使用合法码字分布）
 
 # 优化器参数
 lr = 1e-4
 weight_decay = 1e-4
-epochs = 200
+epochs = 500
 
 # 训练模式：'adaptive' (余弦退火+早停) 或 'fixed' (固定学习率+固定轮数)
 train_mode = 'fixed'  # 'adaptive' or 'fixed'
@@ -179,7 +183,10 @@ def train_heading_classifier(extractor, head, train_loader, val_loader,
         num_bits=num_bits,
         use_gray_code=True,
         quantizer=quantizer,
-        circular_weight=0.0
+        circular_weight=0.0,
+        label_smoothing_sigma=label_smoothing_sigma,
+        code_constraint_weight=code_constraint_weight,
+        use_codeword_nll=use_codeword_nll
     )
     
     ckpts = [os.path.join(ckpt_dir, f) for f in ["extractor_head_cls.pth", "cls_head.pth"]]
@@ -214,6 +221,7 @@ def train_heading_classifier(extractor, head, train_loader, val_loader,
         total_loss = 0.0
         total_bce = 0.0
         total_geo = 0.0
+        total_code = 0.0
         cnt = 0
 
         for xb, _, yb_head in train_loader:
@@ -233,6 +241,7 @@ def train_heading_classifier(extractor, head, train_loader, val_loader,
             total_loss += loss.item() * bs
             total_bce += details['bce'] * bs
             total_geo += details['geo'] * bs
+            total_code += details['code'] * bs
             cnt += bs
 
         if scheduler is not None:
@@ -241,6 +250,7 @@ def train_heading_classifier(extractor, head, train_loader, val_loader,
         avg_train_loss = total_loss / max(cnt, 1)
         avg_bce = total_bce / max(cnt, 1)
         avg_geo = total_geo / max(cnt, 1)
+        avg_code = total_code / max(cnt, 1)
 
         # 验证 Loop
         extractor.eval()
@@ -298,7 +308,7 @@ def train_heading_classifier(extractor, head, train_loader, val_loader,
             current_lr = scheduler.get_last_lr()[0] if scheduler else lr
             # 打印包含双流 Loss 的信息
             print(f"[Heading Ep {ep+1}] "
-                  f"Loss: {avg_train_loss:.4f} (BCE_A:{avg_bce:.3f}, BCE_B:{avg_bce:.3f}, Geo:{avg_geo:.3f}, W:{current_geo_weight}) "
+                  f"Loss: {avg_train_loss:.4f} (BCE_A:{avg_bce:.3f}, BCE_B:{avg_bce:.3f}, Geo:{avg_geo:.3f}, Code:{avg_code:.3f}, W:{current_geo_weight}) "
                   f"| Val MAE: {np.degrees(mae.item()):.2f}° "
                   f"| Time: {time.time()-t0:.1f}s")
 
@@ -395,13 +405,19 @@ def main():
     print("\n📐 初始化量化器...")
     quantizer = HeadingQuantizer(
         num_bins=num_bins,
-        use_gray_code=True
+        use_gray_code=True,
+        use_rs=use_rs
     )
     
     # 检查是否已有保存的量化器
     if os.path.exists(quantizer_path):
         print(f"  发现已有量化器，从 {quantizer_path} 加载")
         quantizer.load(quantizer_path)
+        if quantizer.use_rs != use_rs:
+            print("  量化器纠错设置与当前配置不一致，重新拟合并保存")
+            quantizer = HeadingQuantizer(num_bins=num_bins, use_gray_code=True, use_rs=use_rs)
+            quantizer.fit(head_tr_np)
+            quantizer.save(quantizer_path)
     else:
         # 仅使用训练集数据拟合量化器（防止数据泄漏）
         print("  使用训练集数据拟合量化器...")

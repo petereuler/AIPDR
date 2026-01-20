@@ -10,7 +10,7 @@ from data.dataset_SELFMADE import load_selfmade_raw, window_dataset as selfmade_
 from data.dataset_RONIN import load_ronin_raw, window_dataset as ronin_window
 from models.heading_classifier import (
     FeatureExtractor, RegressorHead,
-    HeadingQuantizer, HeadingBinaryHead,
+    HeadingQuantizer, HeadingBinaryHead, RS51Codec,
 )
 from src.util import generate_trajectory_2d
 from src.pdr import PDR
@@ -47,7 +47,8 @@ dataset = "OXIOD"
 # 航向角量化参数（必须与 trainc.py 一致）
 num_bits = 8  # 必须是 4 的倍数
 num_bins = 2 ** num_bits  # 4096 个 bin
-output_bits = num_bits
+use_rs = True  # 启用 RS(5,1) 纠错编码（符号重复）
+output_bits = num_bits * 5
 encoding_mode = 'binary_code'
 
 
@@ -61,11 +62,21 @@ def load_models(ckpt_dir, device):
     # 加载量化器（关键：必须使用训练时保存的量化器）
     quantizer_path = os.path.join(ckpt_dir, "quantizer.json")
     if os.path.exists(quantizer_path):
-        quantizer = HeadingQuantizer(num_bins=num_bins, use_gray_code=True, )
+        quantizer = HeadingQuantizer(num_bins=num_bins, use_gray_code=True, use_rs=use_rs)
         quantizer.load(quantizer_path)
+        if quantizer.use_rs != use_rs:
+            print("警告: 量化器纠错设置与当前配置不一致，强制使用当前配置")
+            quantizer.use_rs = use_rs
+            quantizer.rs = None if not use_rs else RS51Codec().configure(quantizer.num_bits)
+            if quantizer.use_rs:
+                quantizer.code_bits = quantizer.num_bits * 5
+                quantizer.all_codewords = quantizer.rs.encode(quantizer.all_gray_codes.astype(np.int32)).astype(np.float32)
+            else:
+                quantizer.code_bits = quantizer.num_bits
+                quantizer.all_codewords = quantizer.all_gray_codes
     else:
         print(f"警告: 未找到量化器文件 {quantizer_path}，使用均匀量化")
-        quantizer = HeadingQuantizer(num_bins=num_bins, use_gray_code=True, )
+        quantizer = HeadingQuantizer(num_bins=num_bins, use_gray_code=True, use_rs=use_rs)
         # 手动设置均匀量化的边界
         quantizer.bin_edges = np.linspace(-np.pi, np.pi, num_bins + 1)
         quantizer.bin_centers = (quantizer.bin_edges[:-1] + quantizer.bin_edges[1:]) / 2
@@ -176,6 +187,13 @@ def predict_in_batches(models, quantizer, gx, ax, batch_size=256, temperature=1.
         return pred_len, pred_head_soft, pred_head_hard
 
 
+def extract_rs51_data_bits(code_bits, num_bits):
+    """Extract data bits from RS(5,1) repetition codewords."""
+    if code_bits.shape[1] != num_bits * 5:
+        raise ValueError("RS(5,1) code length must be num_bits*5.")
+    return code_bits[:, :num_bits]
+
+
 def main():
     project_dir = "/home/admin407/code/zyshe/NavCorrector"
     data_root = os.path.join(project_dir, "OXIOD")
@@ -228,7 +246,7 @@ def main():
             os.path.join(data_root, 'handheld', 'data3', 'syn', 'imu1.csv'),
             os.path.join(data_root, 'handheld', 'data4', 'syn', 'imu1.csv'),
             os.path.join(data_root, 'handheld', 'data4', 'syn', 'imu3.csv'),
-            os.path.join(data_root, 'handheld', 'data5', 'syn', 'imu1.csv'),
+            os.path.join(data_root, 'handheld', 'data5', 'syn', 'imu3.csv'),
             #os.path.join(data_root, 'handheld', 'data1', 'syn', 'imu1.csv'),
         ]
         gt_files = [f.replace("imu", "vi") for f in imu_files]
@@ -237,6 +255,7 @@ def main():
     all_len_mae = []
     all_head_mae = []
     all_rmse = []
+    ecc_stats = []
 
     # 逐文件测试
     for imu_file, gt_file in zip(imu_files, gt_files):
@@ -336,10 +355,9 @@ def main():
             dl_raw = None
             dh_raw = None
         
-        # 编码错误统计和可视化（使用平滑前的真值）
+        # 编码错误统计和可视化（使用平滑后的真值，保证与训练一致）
         file_prefix = base_name
-        # 使用平滑前的真值进行编码错误分析
-        dh_gt_for_encoding = dh_raw if dh_raw is not None else dh
+        dh_gt_for_encoding = dh
         dh_np = dh_gt_for_encoding[:len(pred_binary_probs)] if len(pred_binary_probs) <= len(dh_gt_for_encoding) else dh_gt_for_encoding
         if isinstance(dh_np, torch.Tensor):
             dh_np = dh_np.cpu().numpy()
@@ -355,6 +373,40 @@ def main():
             output_dir,
             file_prefix
         )
+
+        # 纠错前/后对比统计（仅在启用 RS(5,1) 时）
+        if use_rs:
+            n_enc = min(len(dh_np), len(pred_binary_hard))
+            gt_code = quantizer.encode_to_binary_vector(dh_np[:n_enc])
+            pred_code = pred_binary_hard[:n_enc]
+
+            gt_data = extract_rs51_data_bits(gt_code, num_bits)
+            pred_data_before = extract_rs51_data_bits(pred_code, num_bits)
+
+            # MAP 解码得到 bin，再转换为数据位
+            pred_angles = quantizer.decode_from_binary_vector(pred_binary_probs[:n_enc])
+            pred_bins = quantizer.encode(pred_angles)
+            if quantizer.use_gray_code:
+                pred_data_after = quantizer.all_gray_codes[pred_bins]
+            else:
+                pred_data_after = np.stack([np.array([(b >> i) & 1 for i in range(num_bits - 1, -1, -1)], dtype=np.int32)
+                                            for b in pred_bins], axis=0)
+
+            code_bit_err = (pred_code != gt_code).mean()
+            data_bit_err_before = (pred_data_before != gt_data).mean()
+            data_bit_err_after = (pred_data_after != gt_data).mean()
+            perfect_before = (pred_data_before == gt_data).all(axis=1).mean()
+            perfect_after = (pred_data_after == gt_data).all(axis=1).mean()
+
+            ecc_stats.append({
+                "file": base_name,
+                "samples": n_enc,
+                "code_bit_error_rate": code_bit_err,
+                "data_bit_error_before": data_bit_err_before,
+                "data_bit_error_after": data_bit_err_after,
+                "data_perfect_before": perfect_before,
+                "data_perfect_after": perfect_after,
+            })
 
         # 生成轨迹（基于步长+航向角累积）
         traj_gt = generate_trajectory_2d(init_l, init_h, dl, dh[:len(dl)])
@@ -545,6 +597,12 @@ def main():
         bin_widths = np.diff(quantizer.bin_edges)
         print(f"  量化精度范围: [{np.degrees(bin_widths.min())/2:.2f}deg, {np.degrees(bin_widths.max())/2:.2f}deg]")
     print("="*60)
+
+    if use_rs and ecc_stats:
+        ecc_df = pd.DataFrame(ecc_stats)
+        ecc_path = os.path.join(output_dir, "ecc_summary.csv")
+        ecc_df.to_csv(ecc_path, index=False)
+        print(f"\nECC 统计已保存: {ecc_path}")
 
     print(f"\n测试完成！结果保存在: {output_dir}")
 
