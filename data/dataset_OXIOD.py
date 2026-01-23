@@ -8,6 +8,18 @@ def wrap_angle(angle):
     """将角度归一化到 [-pi, pi] 范围，支持标量或数组。"""
     return (angle + np.pi) % (2 * np.pi) - np.pi
 
+def quat_conj(q):
+    return np.array([q[0], -q[1], -q[2], -q[3]], dtype=np.float32)
+
+def quat_mul(q1, q2):
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
+    w = w1*w2 - x1*x2 - y1*y2 - z1*z2
+    x = w1*x2 + x1*w2 + y1*z2 - z1*y2
+    y = w1*y2 - x1*z2 + y1*w2 + z1*x2
+    z = w1*z2 + x1*y2 - y1*x2 + z1*w2
+    return np.array([w, x, y, z], dtype=np.float32)
+
 def moving_average(x, k):
     """简易滑动平均滤波，窗口 k>=1；k<=1 时原样返回。"""
     if k is None or k <= 1:
@@ -78,7 +90,7 @@ def load_oxiod_raw(imu_data_filename, gt_data_filename):
 
     return gyro_data, acc_data, pos_data, ori_data
 
-def window_dataset(gyro_data, acc_data, pos_data, ori_data, mode = "2d", window_size = 160, stride = 36, filter_window = 20, smooth_heading = True, heading_sigma = 5, smooth_length = False, length_sigma = 5):
+def window_dataset(gyro_data, acc_data, pos_data, ori_data, mode = "2d", window_size = 160, stride = 36, filter_window = 20, smooth_heading = True, heading_sigma = 5, smooth_length = False, length_sigma = 5, return_rel_ori=False, return_delta_p=False):
     mid = window_size // 2 - stride // 2
     if mode == "2d":
         pos2d = pos_data[:, :2]
@@ -92,6 +104,8 @@ def window_dataset(gyro_data, acc_data, pos_data, ori_data, mode = "2d", window_
         x_acc = []
         y_len = []
         y_head = []
+        y_rel = []
+        y_dp = []
         
         # 初始化
         # 为了计算 chord_angle_prev，我们需要知道前一个窗口的弦角
@@ -188,11 +202,23 @@ def window_dataset(gyro_data, acc_data, pos_data, ori_data, mode = "2d", window_
 
             y_len .append(np.array([delta_len], dtype=np.float32))
             y_head.append(np.array([delta_head], dtype=np.float32))
+            if return_delta_p:
+                pa3 = pos_data[a, :]
+                pb3 = pos_data[b, :]
+                y_dp.append((pb3 - pa3).astype(np.float32))
+            if return_rel_ori:
+                qa = ori_data[a].astype(np.float32)
+                qb = ori_data[b].astype(np.float32)
+                y_rel.append(quat_mul(qb, quat_conj(qa)))
 
         x_gyro = np.array(x_gyro)
         x_acc  = np.array(x_acc)
         y_len  = np.array(y_len)
         y_head = np.array(y_head)
+        if return_rel_ori:
+            y_rel = np.array(y_rel)
+        if return_delta_p:
+            y_dp = np.array(y_dp)
         
         # 在平滑之前进行数据清洗：基于步长判断静止状态
         # 如果步长绝对值小于阈值，说明处于静止状态，将步长和航向角都设为0
@@ -214,6 +240,12 @@ def window_dataset(gyro_data, acc_data, pos_data, ori_data, mode = "2d", window_
             y_head_smooth = gaussian_filter1d(y_head.flatten(), sigma=heading_sigma)
             y_head = y_head_smooth.reshape(-1, 1)
 
+        if return_rel_ori and return_delta_p:
+            return [x_gyro, x_acc], [y_len, y_head, y_rel, y_dp], init_pos, init_head
+        if return_rel_ori:
+            return [x_gyro, x_acc], [y_len, y_head, y_rel], init_pos, init_head
+        if return_delta_p:
+            return [x_gyro, x_acc], [y_len, y_head, y_dp], init_pos, init_head
         return [x_gyro, x_acc], [y_len, y_head], init_pos, init_head
 
     elif mode == "3d":

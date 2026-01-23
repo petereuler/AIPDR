@@ -198,49 +198,119 @@ def create_gray_code_table(num_bits):
     return bin_to_gray, gray_to_bin
 
 
-class RS51Codec:
-    """RS(5,1) over GF(2^m) reduces to symbol repetition (5 copies)."""
-    def __init__(self):
-        self.data_bits = None
-        self.code_bits = None
+def gray_encode_tensor(x, num_bits):
+    """Vectorized Gray code for integer tensor."""
+    g = x ^ (x >> 1)
+    shifts = torch.arange(num_bits - 1, -1, -1, device=x.device, dtype=x.dtype)
+    bits = ((g.unsqueeze(1) >> shifts) & 1).float()
+    return bits
 
-    def configure(self, data_bits):
-        self.data_bits = data_bits
-        self.code_bits = data_bits * 5
-        return self
+
+def hamming74_encode_tensor(u):
+    """Hamming(7,4) systematic encode. u: (B,4) in {0,1}."""
+    P = torch.tensor([
+        [1, 1, 0, 1],
+        [1, 0, 1, 1],
+        [0, 1, 1, 1],
+    ], dtype=u.dtype, device=u.device)
+    p = torch.remainder(u @ P.T, 2.0)
+    return torch.cat([u, p], dim=1)
+
+
+def AngleToSoftLabel(theta, num_bits=12):
+    """
+    Angle -> 12-bit Gray -> block-wise Hamming(7,4) -> 21-bit target.
+    theta: (B,) in radians.
+    Returns: (B, 21) float tensor in {0,1}.
+    """
+    theta = torch.remainder(theta + np.pi, 2 * np.pi)
+    bins = 2 ** num_bits
+    q = torch.floor(theta / (2 * np.pi) * bins).long()
+    q = torch.clamp(q, 0, bins - 1)
+    g = gray_encode_tensor(q, num_bits)  # (B, 12)
+    blocks = torch.split(g, 4, dim=1)
+    cw = [hamming74_encode_tensor(b) for b in blocks]
+    return torch.cat(cw, dim=1).float()
+
+
+class HammingSyndromeLoss(nn.Module):
+    """
+    Soft Syndrome Loss for block-wise (7,4) Hamming codes.
+    """
+    def __init__(self, T=1.0):
+        super().__init__()
+        self.T = T
+        # Systematic form: [D0 D1 D2 D3 P0 P1 P2]
+        H_base = torch.tensor([
+            [1, 1, 0, 1, 1, 0, 0],
+            [1, 0, 1, 1, 0, 1, 0],
+            [0, 1, 1, 1, 0, 0, 1],
+        ], dtype=torch.float32)
+        H_total = torch.zeros(9, 21, dtype=torch.float32)
+        H_total[0:3, 0:7] = H_base
+        H_total[3:6, 7:14] = H_base
+        H_total[6:9, 14:21] = H_base
+        self.register_buffer("H_total", H_total)
+
+    def forward(self, logits):
+        x = torch.tanh(logits / self.T)
+        H = self.H_total.to(logits.device)
+        x_exp = x.unsqueeze(1)
+        mask = H.unsqueeze(0)
+        x_masked = x_exp * mask + (1.0 - mask)
+        S = torch.prod(x_masked, dim=2)
+        loss = torch.mean((1.0 - S) ** 2)
+        return loss
+
+
+class Hamming74Codec:
+    """Hamming(7,4) block code. Order: [d0, d1, d2, d3, p0, p1, p2]."""
+    def __init__(self):
+        self.data_bits = 4
+        self.code_bits = 7
 
     def encode(self, data_bits):
-        """
-        Args:
-            data_bits: np.ndarray, shape (N, K)
-        Returns:
-            code_bits: np.ndarray, shape (N, K*5)
-        """
         n, k = data_bits.shape
-        if self.data_bits is None:
-            raise ValueError("RS51Codec must be configured with data_bits.")
-        if k != self.data_bits:
-            raise ValueError("RS(5,1) expects exactly one symbol.")
-        code = np.repeat(data_bits, 5, axis=1)
-        return code
+        n_blocks = int(np.ceil(k / self.data_bits))
+        pad = n_blocks * self.data_bits - k
+        if pad > 0:
+            data_bits = np.concatenate([data_bits, np.zeros((n, pad), dtype=data_bits.dtype)], axis=1)
+        data_bits = data_bits.reshape(n, n_blocks, self.data_bits)
+        u = data_bits  # (n, blocks, 4)
+        P = np.array([
+            [1, 1, 0, 1],
+            [1, 0, 1, 1],
+            [0, 1, 1, 1],
+        ], dtype=np.int32)
+        p = (u @ P.T) % 2
+        code = np.concatenate([u, p], axis=2)
+        return code.reshape(n, n_blocks * self.code_bits)
 
-    def decode(self, code_bits, code_probs=None):
-        """
-        Args:
-            code_bits: np.ndarray, shape (N, M)
-            code_probs: np.ndarray or None, shape (N, M) with values in [0,1]
-        Returns:
-            data_bits: np.ndarray, shape (N, data_bits)
-        """
+    def decode(self, code_bits):
         n, m = code_bits.shape
-        if self.data_bits is None:
-            raise ValueError("RS51Codec must be configured with data_bits.")
-        if m != self.code_bits:
-            raise ValueError("RS(5,1) expects exactly 5 symbols.")
-        bits = code_bits.reshape(n, 5, self.data_bits)
-        # majority vote per bit
-        majority = (bits.sum(axis=1) >= 3).astype(bits.dtype)
-        return majority
+        if m % self.code_bits != 0:
+            raise ValueError("Hamming(7,4) code length must be a multiple of 7.")
+        n_blocks = m // self.code_bits
+        bits = code_bits.reshape(n, n_blocks, self.code_bits).copy()
+        H = np.array([
+            [1, 1, 0, 1, 1, 0, 0],
+            [1, 0, 1, 1, 0, 1, 0],
+            [0, 1, 1, 1, 0, 0, 1],
+        ], dtype=np.int32)
+        out = []
+        for i in range(n):
+            block = bits[i]
+            s = (block @ H.T) % 2  # (blocks, 3)
+            for b in range(n_blocks):
+                if s[b].sum() == 0:
+                    continue
+                for col in range(7):
+                    if np.array_equal(H[:, col], s[b]):
+                        block[b, col] = 1 - block[b, col]
+                        break
+            out.append(block[:, :4])
+        data = np.stack(out, axis=0).reshape(n, n_blocks * self.data_bits)
+        return data
 
 
 
@@ -252,19 +322,19 @@ class HeadingQuantizer:
     航向角均匀量化器
     将连续的航向角（-π到π）均匀量化到离散的bin索引
     """
-    def __init__(self, num_bins=256, use_gray_code=True, use_rs=False):
+    def __init__(self, num_bins=256, use_gray_code=True, use_hamming=False):
         self.num_bins = num_bins
         self.num_bits = int(np.log2(num_bins))
         self.use_gray_code = use_gray_code
-        self.use_rs = use_rs
+        self.use_hamming = use_hamming
         self.adaptive = False  # HeadingQuantizer始终使用均匀量化
 
-        # RS(5,1) block code (symbol repetition)
-        self.rs = RS51Codec().configure(self.num_bits) if self.use_rs else None
+        self.hamming = Hamming74Codec() if self.use_hamming else None
 
         # 输出位数等于输入位数（无纠错）或扩展后的码长（纠错）
-        if self.use_rs:
-            self.code_bits = self.rs.code_bits
+        if self.use_hamming:
+            n_blocks = int(np.ceil(self.num_bits / self.hamming.data_bits))
+            self.code_bits = n_blocks * self.hamming.code_bits
         else:
             self.code_bits = self.num_bits
 
@@ -290,8 +360,8 @@ class HeadingQuantizer:
                                            for i in range(self.num_bins)], dtype=np.float32)
 
         # 如果启用纠错编码，预计算所有码字
-        if self.use_rs:
-            self.all_codewords = self.rs.encode(self.all_gray_codes.astype(np.int32)).astype(np.float32)
+        if self.use_hamming:
+            self.all_codewords = self.hamming.encode(self.all_gray_codes.astype(np.int32)).astype(np.float32)
         else:
             self.all_codewords = self.all_gray_codes
 
@@ -347,14 +417,19 @@ class HeadingQuantizer:
         if hasattr(binary_probs, 'cpu'):
             binary_probs = binary_probs.cpu().numpy()
 
-        if self.use_rs:
-            # MAP 码字解码：在所有合法码字中选择概率最大的 bin
-            probs = np.clip(binary_probs, 1e-8, 1 - 1e-8)
-            log_probs_1 = np.log(probs)[:, None, :]
-            log_probs_0 = np.log(1 - probs)[:, None, :]
-            codes = self.all_codewords.astype(np.float32)[None, :, :]
-            bin_log_probs = np.sum(codes * log_probs_1 + (1 - codes) * log_probs_0, axis=2)
-            bin_indices = np.argmax(bin_log_probs, axis=1)
+        if self.use_hamming:
+            binary_vectors = (binary_probs >= 0.5).astype(int)
+            data_bits = self.hamming.decode(binary_vectors)
+            data_bits = data_bits[:, :self.num_bits]
+            bin_indices = []
+            for binary_vec in data_bits:
+                if self.use_gray_code:
+                    gray_value = binary_array_to_int(binary_vec)
+                    bin_idx = self.gray_to_bin[gray_value]
+                else:
+                    bin_idx = binary_array_to_int(binary_vec)
+                bin_indices.append(bin_idx)
+            bin_indices = np.array(bin_indices)
             return self.decode(bin_indices)
 
         # 将概率转换为二进制向量（阈值0.5）
@@ -449,8 +524,8 @@ class HeadingQuantizer:
 
         binary_vectors = np.array(binary_vectors)
 
-        if self.use_rs:
-            binary_vectors = self.rs.encode(binary_vectors.astype(np.int32))
+        if self.use_hamming:
+            binary_vectors = self.hamming.encode(binary_vectors.astype(np.int32))
 
         return binary_vectors
 
@@ -480,7 +555,7 @@ class HeadingQuantizer:
             'num_bins': self.num_bins,
             'num_bits': self.num_bits,
             'use_gray_code': self.use_gray_code,
-            'use_rs': self.use_rs,
+            'use_hamming': self.use_hamming,
             'code_bits': self.code_bits,
             'angle_range': self.angle_range,
             'bin_width': self.bin_width,
@@ -506,7 +581,7 @@ class HeadingQuantizer:
             self.num_bins = int(state['num_bins'])
             self.num_bits = int(state['num_bits'])
             self.use_gray_code = bool(state['use_gray_code'])
-            self.use_rs = bool(state.get('use_rs', False))
+            self.use_hamming = bool(state.get('use_hamming', False))
             self.code_bits = int(state['code_bits'])
             self.angle_range = float(state['angle_range'])
             self.bin_width = float(state['bin_width'])
@@ -524,10 +599,10 @@ class HeadingQuantizer:
                 self.bin_to_gray = None
                 self.gray_to_bin = None
 
-            self.rs = RS51Codec().configure(self.num_bits) if self.use_rs else None
+            self.hamming = Hamming74Codec() if self.use_hamming else None
 
-            if self.use_rs:
-                self.all_codewords = self.rs.encode(self.all_gray_codes.astype(np.int32)).astype(np.float32)
+            if self.use_hamming:
+                self.all_codewords = self.hamming.encode(self.all_gray_codes.astype(np.int32)).astype(np.float32)
             else:
                 self.all_codewords = self.all_gray_codes
 
@@ -696,19 +771,7 @@ class HeadingBinaryLoss(nn.Module):
             # 用码字级NLL替代逐bit BCE
             bce_loss = code_nll
 
-        # RS(5,1)一致性约束损失（仅在启用纠错编码时）
         code_loss = torch.tensor(0.0, device=logits.device)
-        if self.code_constraint_weight > 0 and self.quantizer.use_rs:
-            probs = torch.sigmoid(logits)
-            code_bits = probs.shape[1]
-            if code_bits % 5 != 0:
-                raise ValueError("RS(5,1) code length must be num_bits*5.")
-            blocks = probs.view(probs.shape[0], 5, -1)
-            p0, p1, p2, p3, p4 = [blocks[:, i, :] for i in range(5)]
-            code_loss = (torch.abs(p0 - p1) + torch.abs(p0 - p2) + torch.abs(p0 - p3) + torch.abs(p0 - p4) +
-                         torch.abs(p1 - p2) + torch.abs(p1 - p3) + torch.abs(p1 - p4) +
-                         torch.abs(p2 - p3) + torch.abs(p2 - p4) +
-                         torch.abs(p3 - p4)).mean()
 
         # 辅助损失：周期性几何约束 (针对 Angle)
         if self.circular_weight > 0:

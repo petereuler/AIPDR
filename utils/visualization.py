@@ -7,6 +7,7 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
+import torch
 from matplotlib.collections import LineCollection
 from matplotlib.colors import Normalize
 import matplotlib.cm as cm
@@ -241,7 +242,7 @@ def plot_heading_analysis(dh, pred_head_soft, pred_head_hard, vis_num, output_pa
              linewidth=1.0, color='tab:orange', alpha=0.6)
     
     # 显示自适应量化信息
-    if quantizer.adaptive and quantizer.fitted:
+    if getattr(quantizer, "adaptive", False) and getattr(quantizer, "fitted", False):
         bin_widths = np.diff(quantizer.bin_edges)
         min_width = np.degrees(bin_widths.min())
         max_width = np.degrees(bin_widths.max())
@@ -495,7 +496,7 @@ def plot_error_histogram(dl, dh, pred_len, pred_head, vis_num, output_path, quan
     axes[1].axvline(0, color='black', linestyle='-', linewidth=0.5)
     
     # 量化误差参考线（自适应量化）- 仅在有量化器时显示
-    if quantizer is not None and quantizer.adaptive and quantizer.fitted:
+    if quantizer is not None and getattr(quantizer, "adaptive", False) and getattr(quantizer, "fitted", False):
         bin_widths = np.diff(quantizer.bin_edges)
         median_width = np.degrees(np.median(bin_widths))
         axes[1].axvline(median_width/2, color='gray', linestyle=':', 
@@ -529,7 +530,12 @@ def analyze_encoding_errors(gt_heading, pred_binary_probs, pred_binary_hard, qua
         file_prefix: 文件前缀
     """
     # 1. 计算真值编码
-    gt_binary = quantizer.encode_to_binary_vector(gt_heading)
+    if hasattr(quantizer, "angle_to_codeword"):
+        gt_binary = quantizer.angle_to_codeword(
+            torch.tensor(gt_heading, dtype=torch.float32)
+        ).cpu().numpy()
+    else:
+        gt_binary = quantizer.encode_to_binary_vector(gt_heading)
     
     gt_binary_hard = (gt_binary > 0.5).astype(np.int32)
     
@@ -691,7 +697,13 @@ def analyze_encoding_errors(gt_heading, pred_binary_probs, pred_binary_hard, qua
     # 8.6 错误位数 vs 角度误差散点图（改进版：添加趋势线和统计）
     ax6 = plt.subplot(3, 3, 6)
     # 计算角度误差
-    pred_heading = quantizer.decode_from_binary_vector(pred_binary_probs)
+    if hasattr(quantizer, "decode_soft_expectation"):
+        logits = np.log(pred_binary_probs + 1e-8) - np.log(1.0 - pred_binary_probs + 1e-8)
+        pred_heading = quantizer.decode_soft_expectation(
+            torch.tensor(logits, dtype=torch.float32)
+        ).cpu().numpy()
+    else:
+        pred_heading = quantizer.decode_from_binary_vector(pred_binary_probs)
     
     angle_errors = np.abs(wrap_angle(pred_heading - gt_heading))
     angle_errors_deg = np.degrees(angle_errors)

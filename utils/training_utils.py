@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 from data.dataset_OXIOD import load_oxiod_raw, window_dataset as oxiod_window
 from data.dataset_SELFMADE import load_selfmade_raw, window_dataset as selfmade_window
 from data.dataset_RONIN import load_ronin_raw, window_dataset as ronin_window
+from data.dataset_RIDI import load_ridi_raw, window_dataset as ridi_window
 
 
 # ======= 损失函数 =======
@@ -256,6 +257,358 @@ def load_data_2d_ronin(ronin_root, device, window_size=160, stride=32):
     return x_tr, ylen_tr, yhead_tr, x_va, ylen_va, yhead_va
 
 
+def load_data_2d_ridi(ridi_root, device, window_size=160, stride=32):
+    """
+    加载 RIDI 数据集并分割为训练集和验证集
+
+    Args:
+        ridi_root: RIDI 数据集根目录
+        device: torch 设备
+        window_size: 窗口大小
+        stride: 步长
+        使用官方发布的 train/test 列表划分
+
+    Returns:
+        x_tr, ylen_tr, yhead_tr, x_va, ylen_va, yhead_va
+    """
+    data_root = os.path.join(ridi_root, "data")
+    train_list = os.path.join(data_root, "list_train_publish_v2.txt")
+    test_list = os.path.join(data_root, "list_test_publish_v2.txt")
+    if not (os.path.exists(train_list) and os.path.exists(test_list)):
+        raise RuntimeError("RIDI list_train/list_test files not found under RIDI/data")
+
+    def _load_list(path):
+        names = []
+        with open(path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                names.append(line.split(",")[0])
+        return names
+
+    train_names = _load_list(train_list)
+    val_names = _load_list(test_list)
+
+    xg_tr, xa_tr, yl_tr, yh_tr = [], [], [], []
+    xg_va, xa_va, yl_va, yh_va = [], [], [], []
+
+    for name in train_names + val_names:
+        seq_dir = os.path.join(data_root, name)
+        if not os.path.isdir(seq_dir):
+            continue
+        gyro, acc, pos3d, ori = load_ridi_raw(seq_dir)
+        [gx, ax], [dl, dh], _, _ = ridi_window(
+            gyro, acc, pos3d, ori,
+            mode="2d",
+            window_size=window_size,
+            stride=stride,
+            filter_window=20,
+            smooth_heading=False,
+            heading_sigma=1.5,
+            smooth_length=False,
+            length_sigma=1.0,
+        )
+        if name in val_names:
+            xg_va.append(gx)
+            xa_va.append(ax)
+            yl_va.append(dl)
+            yh_va.append(dh)
+        else:
+            xg_tr.append(gx)
+            xa_tr.append(ax)
+            yl_tr.append(dl)
+            yh_tr.append(dh)
+
+    x_tr = np.concatenate(xg_tr, axis=0)
+    x_tr = np.concatenate([x_tr, np.concatenate(xa_tr, axis=0)], axis=-1)
+    x_tr = torch.tensor(x_tr, dtype=torch.float32, device=device)
+    ylen_tr = torch.tensor(np.concatenate(yl_tr, axis=0), dtype=torch.float32, device=device)
+    yhead_tr = torch.tensor(np.concatenate(yh_tr, axis=0), dtype=torch.float32, device=device)
+
+    x_va = np.concatenate(xg_va, axis=0)
+    x_va = np.concatenate([x_va, np.concatenate(xa_va, axis=0)], axis=-1)
+    x_va = torch.tensor(x_va, dtype=torch.float32, device=device)
+    ylen_va = torch.tensor(np.concatenate(yl_va, axis=0), dtype=torch.float32, device=device)
+    yhead_va = torch.tensor(np.concatenate(yh_va, axis=0), dtype=torch.float32, device=device)
+
+    return x_tr, ylen_tr, yhead_tr, x_va, ylen_va, yhead_va
+
+
+def load_data_2d_ridi_absheading(ridi_root, device, window_size=160, stride=32, return_ori=False, return_rel_ori=False, return_seq=False, return_init=False, return_delta_p=False, use_abs_heading=True):
+    """
+    加载 RIDI 数据集并分割为训练/验证，返回绝对航向标签
+    """
+    data_root = os.path.join(ridi_root, "data")
+    train_list = os.path.join(data_root, "list_train_publish_v2.txt")
+    test_list = os.path.join(data_root, "list_test_publish_v2.txt")
+    if not (os.path.exists(train_list) and os.path.exists(test_list)):
+        raise RuntimeError("RIDI list_train/list_test files not found under RIDI/data")
+
+    def _load_list(path):
+        names = []
+        with open(path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                names.append(line.split(",")[0])
+        return names
+
+    train_names = _load_list(train_list)
+    val_names = _load_list(test_list)
+
+    xg_tr, xa_tr, yl_tr, ya_tr, yp_tr, yo_tr, yr_tr, yi_tr = [], [], [], [], [], [], [], []
+    xg_va, xa_va, yl_va, ya_va, yp_va, yo_va, yr_va, yi_va = [], [], [], [], [], [], [], []
+    seq_tr = []
+    seq_va = []
+
+    for name in train_names + val_names:
+        seq_dir = os.path.join(data_root, name)
+        if not os.path.isdir(seq_dir):
+            continue
+        gyro, acc, pos3d, ori = load_ridi_raw(seq_dir)
+        # compute init rotation aligned to chord frame using sequence-level yaw offset
+        pos2d = pos3d[:, :2]
+        max_start = gyro.shape[0] - window_size - 1
+        b_indices = []
+        a_indices = []
+        for idx in range(0, max_start, stride):
+            a = idx + window_size // 2 - stride // 2
+            b = idx + window_size // 2 + stride // 2
+            a = max(0, min(a, len(pos2d) - 1))
+            b = max(0, min(b, len(pos2d) - 1))
+            a_indices.append(a)
+            b_indices.append(b)
+        a_indices = np.array(a_indices, dtype=np.int64)
+        b_indices = np.array(b_indices, dtype=np.int64)
+
+        if return_rel_ori and return_ori and return_delta_p:
+            [gx, ax], [dl, y_head, abs_h, dori, drel, dp], _, init_head = ridi_window(
+                gyro, acc, pos3d, ori,
+                mode="2d",
+                window_size=window_size,
+                stride=stride,
+                filter_window=0,
+                smooth_heading=False,
+                heading_sigma=1.0,
+                smooth_length=False,
+                length_sigma=1.0,
+                return_abs_heading=True,
+                return_ori=True,
+                return_rel_ori=True,
+                return_delta_p=True,
+                abs_heading_from_ori=False,
+                align_heading_to_init_pose=True,
+            )
+        elif return_rel_ori and return_delta_p:
+            [gx, ax], [dl, y_head, abs_h, drel, dp], _, init_head = ridi_window(
+                gyro, acc, pos3d, ori,
+                mode="2d",
+                window_size=window_size,
+                stride=stride,
+                filter_window=0,
+                smooth_heading=False,
+                heading_sigma=1.0,
+                smooth_length=False,
+                length_sigma=1.0,
+                return_abs_heading=True,
+                return_rel_ori=True,
+                return_delta_p=True,
+                abs_heading_from_ori=False,
+                align_heading_to_init_pose=True,
+            )
+        elif return_rel_ori and return_ori:
+            [gx, ax], [dl, y_head, abs_h, dori, drel], _, init_head = ridi_window(
+                gyro, acc, pos3d, ori,
+                mode="2d",
+                window_size=window_size,
+                stride=stride,
+                filter_window=0,
+                smooth_heading=False,
+                heading_sigma=1.0,
+                smooth_length=False,
+                length_sigma=1.0,
+                return_abs_heading=True,
+                return_ori=True,
+                return_rel_ori=True,
+                abs_heading_from_ori=False,
+                align_heading_to_init_pose=True,
+            )
+        elif return_rel_ori:
+            [gx, ax], [dl, y_head, abs_h, drel], _, init_head = ridi_window(
+                gyro, acc, pos3d, ori,
+                mode="2d",
+                window_size=window_size,
+                stride=stride,
+                filter_window=0,
+                smooth_heading=False,
+                heading_sigma=1.0,
+                smooth_length=False,
+                length_sigma=1.0,
+                return_abs_heading=True,
+                return_rel_ori=True,
+                abs_heading_from_ori=False,
+                align_heading_to_init_pose=True,
+            )
+        elif return_delta_p:
+            [gx, ax], [dl, y_head, abs_h, dp], _, init_head = ridi_window(
+                gyro, acc, pos3d, ori,
+                mode="2d",
+                window_size=window_size,
+                stride=stride,
+                filter_window=0,
+                smooth_heading=False,
+                heading_sigma=1.0,
+                smooth_length=False,
+                length_sigma=1.0,
+                return_abs_heading=True,
+                return_delta_p=True,
+                abs_heading_from_ori=False,
+                align_heading_to_init_pose=True,
+            )
+        else:
+            [gx, ax], [dl, y_head, abs_h], _, init_head = ridi_window(
+            gyro, acc, pos3d, ori,
+            mode="2d",
+            window_size=window_size,
+            stride=stride,
+            filter_window=0,
+            smooth_heading=False,
+            heading_sigma=1.0,
+            smooth_length=False,
+            length_sigma=1.0,
+            return_abs_heading=True,
+            abs_heading_from_ori=False,
+            align_heading_to_init_pose=True,
+            )
+
+        init_q = ori[b_indices[0]].astype(np.float32)
+        # quat to rot
+        iw, ix, iy, iz = init_q
+        ww = iw * iw
+        xx = ix * ix
+        yy = iy * iy
+        zz = iz * iz
+        wx = iw * ix
+        wy = iw * iy
+        wz = iw * iz
+        xy = ix * iy
+        xz = ix * iz
+        yz = iy * iz
+        Rq = np.array([
+            [ww + xx - yy - zz, 2 * (xy - wz), 2 * (xz + wy)],
+            [2 * (xy + wz), ww - xx + yy - zz, 2 * (yz - wx)],
+            [2 * (xz - wy), 2 * (yz + wx), ww - xx - yy + zz],
+        ], dtype=np.float32)
+        yaw_b2w = np.arctan2(Rq[1, 0], Rq[0, 0])
+        diff = init_head - yaw_b2w
+        yaw_offset = np.arctan2(np.sin(diff), np.cos(diff))
+        cz = np.cos(yaw_offset)
+        sz = np.sin(yaw_offset)
+        Rz = np.array([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+        init_rot = Rz @ Rq
+        heading_label = abs_h if use_abs_heading else y_head
+        if name in val_names:
+            xg_va.append(gx)
+            xa_va.append(ax)
+            yl_va.append(dl)
+            ya_va.append(heading_label)
+            if return_delta_p:
+                yp_va.append(dp)
+            if return_ori:
+                yo_va.append(dori)
+            if return_rel_ori:
+                yr_va.append(drel)
+            if return_init:
+                yi_va.append(np.repeat(init_rot[None, :, :], gx.shape[0], axis=0))
+            if return_seq:
+                seq_va.append(np.full((gx.shape[0],), len(seq_va), dtype=np.int64))
+        else:
+            xg_tr.append(gx)
+            xa_tr.append(ax)
+            yl_tr.append(dl)
+            ya_tr.append(heading_label)
+            if return_delta_p:
+                yp_tr.append(dp)
+            if return_ori:
+                yo_tr.append(dori)
+            if return_rel_ori:
+                yr_tr.append(drel)
+            if return_init:
+                yi_tr.append(np.repeat(init_rot[None, :, :], gx.shape[0], axis=0))
+            if return_seq:
+                seq_tr.append(np.full((gx.shape[0],), len(seq_tr), dtype=np.int64))
+
+    x_tr = np.concatenate(xg_tr, axis=0)
+    x_tr = np.concatenate([x_tr, np.concatenate(xa_tr, axis=0)], axis=-1)
+    x_tr = torch.tensor(x_tr, dtype=torch.float32, device=device)
+    ylen_tr = torch.tensor(np.concatenate(yl_tr, axis=0), dtype=torch.float32, device=device)
+    yabs_tr = torch.tensor(np.concatenate(ya_tr, axis=0), dtype=torch.float32, device=device)
+    ydp_tr = None
+    if return_delta_p:
+        ydp_tr = torch.tensor(np.concatenate(yp_tr, axis=0), dtype=torch.float32, device=device)
+    yori_tr = None
+    if return_ori:
+        yori_tr = torch.tensor(np.concatenate(yo_tr, axis=0), dtype=torch.float32, device=device)
+    yrel_tr = None
+    if return_rel_ori:
+        yrel_tr = torch.tensor(np.concatenate(yr_tr, axis=0), dtype=torch.float32, device=device)
+    seqid_tr = None
+    if return_seq:
+        seqid_tr = torch.tensor(np.concatenate(seq_tr, axis=0), dtype=torch.int64, device=device)
+    yinit_tr = None
+    if return_init:
+        yinit_tr = torch.tensor(np.concatenate(yi_tr, axis=0), dtype=torch.float32, device=device)
+
+    x_va = np.concatenate(xg_va, axis=0)
+    x_va = np.concatenate([x_va, np.concatenate(xa_va, axis=0)], axis=-1)
+    x_va = torch.tensor(x_va, dtype=torch.float32, device=device)
+    ylen_va = torch.tensor(np.concatenate(yl_va, axis=0), dtype=torch.float32, device=device)
+    yabs_va = torch.tensor(np.concatenate(ya_va, axis=0), dtype=torch.float32, device=device)
+    ydp_va = None
+    if return_delta_p:
+        ydp_va = torch.tensor(np.concatenate(yp_va, axis=0), dtype=torch.float32, device=device)
+    yori_va = None
+    if return_ori:
+        yori_va = torch.tensor(np.concatenate(yo_va, axis=0), dtype=torch.float32, device=device)
+    yrel_va = None
+    if return_rel_ori:
+        yrel_va = torch.tensor(np.concatenate(yr_va, axis=0), dtype=torch.float32, device=device)
+    seqid_va = None
+    if return_seq:
+        seqid_va = torch.tensor(np.concatenate(seq_va, axis=0), dtype=torch.int64, device=device)
+    yinit_va = None
+    if return_init:
+        yinit_va = torch.tensor(np.concatenate(yi_va, axis=0), dtype=torch.float32, device=device)
+
+    outputs = [x_tr, ylen_tr, yabs_tr]
+    if return_delta_p:
+        outputs.append(ydp_tr)
+    if return_ori:
+        outputs.append(yori_tr)
+    if return_rel_ori:
+        outputs.append(yrel_tr)
+    if return_seq:
+        outputs.append(seqid_tr)
+    if return_init:
+        outputs.append(yinit_tr)
+    outputs += [x_va, ylen_va, yabs_va]
+    if return_delta_p:
+        outputs.append(ydp_va)
+    if return_ori:
+        outputs.append(yori_va)
+    if return_rel_ori:
+        outputs.append(yrel_va)
+    if return_seq:
+        outputs.append(seqid_va)
+    if return_init:
+        outputs.append(yinit_va)
+    return tuple(outputs)
+
+
+
+
 def plot_quantizer_analysis(quantizer, heading_data, curve_dir, num_bins):
     """
     绘制量化器分析图
@@ -322,4 +675,3 @@ def plot_quantizer_analysis(quantizer, heading_data, curve_dir, num_bins):
     plt.close()
     
     print(f"[Quantizer] Analysis saved to {curve_dir}/quantizer_analysis.png")
-

@@ -10,6 +10,18 @@ from RONIN.source.math_util import orientation_to_angles
 def wrap_angle(angle):
     return (angle + np.pi) % (2 * np.pi) - np.pi
 
+def quat_conj(q):
+    return np.array([q[0], -q[1], -q[2], -q[3]], dtype=np.float32)
+
+def quat_mul(q1, q2):
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
+    w = w1*w2 - x1*x2 - y1*y2 - z1*z2
+    x = w1*x2 + x1*w2 + y1*z2 - z1*y2
+    y = w1*y2 - x1*z2 + y1*w2 + z1*x2
+    z = w1*z2 + x1*y2 - y1*x2 + z1*w2
+    return np.array([w, x, y, z], dtype=np.float32)
+
 
 def moving_average(x, k):
     if k is None or k <= 1:
@@ -79,7 +91,7 @@ def load_ronin_raw(seq_path):
     return gyro, acc, pos3, yaw.reshape(-1, 1)
 
 
-def window_dataset(gyro_data, acc_data, pos_data, ori_data, mode="2d", window_size=200, stride=10, filter_window=10, smooth_heading=True, heading_sigma=1, smooth_length=False, length_sigma=1.0):
+def window_dataset(gyro_data, acc_data, pos_data, ori_data, mode="2d", window_size=200, stride=10, filter_window=10, smooth_heading=True, heading_sigma=1, smooth_length=False, length_sigma=1.0, return_rel_ori=False, return_delta_p=False):
     mid = window_size // 2 - stride // 2
     m = min(gyro_data.shape[0], acc_data.shape[0], pos_data.shape[0], ori_data.shape[0])
     gyro_data = gyro_data[:m]
@@ -95,6 +107,8 @@ def window_dataset(gyro_data, acc_data, pos_data, ori_data, mode="2d", window_si
         x_acc = []
         y_len = []
         y_head = []
+        y_rel = []
+        y_dp = []
         
         # init_pos & init_head
         idx_0 = 0
