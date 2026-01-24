@@ -6,19 +6,26 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 
-from models.pose_net import PoseNet, quat_to_rotmat, rotate_imu
+from models.pose_net import PoseNetTransformer, quat_to_rotmat, quat_conj, quat_mul, rotate_imu
 from models.navigator import Navigator
 from utils.training_utils import load_data_2d_ridi_absheading
 from utils.navigator_pipeline import accumulate_rotations, wrap_angle_torch
 
 
 # ======= 参数设置 =======
-window_size = 320
-stride = 64
+window_size = 160
+stride = 32
 batch_size = 64
 feat_dim = 64
 heading_len_eps = 0.01
-use_gt_pose = True
+train_pose = True
+use_gt_pose_for_nav = False
+use_joint_pose_for_nav = True
+w_len_fixed = 0.5
+w_head_fixed = 0.5
+w_dp_fixed = 1.0
+smooth_heading_labels = True
+heading_sigma = 1.5
 
 # 优化器参数
 lr = 1e-4
@@ -74,15 +81,20 @@ def train_pose_net(pose_net, train_loader, val_loader):
             print(f"[Pose Ep {ep+1}] Loss: {avg_loss:.4f} | Time: {time.time()-t0:.1f}s")
 
 
-def train_navigator_with_pose(pose_net, navigator, train_loader, val_loader, use_gt_pose=False):
-    optimizer = optim.AdamW(navigator.parameters(), lr=lr, weight_decay=weight_decay)
+def train_navigator_with_pose(pose_net, navigator, train_loader, val_loader, use_gt_pose_for_nav=False, use_joint_pose_for_nav=False):
+    params = list(navigator.parameters())
+    if use_joint_pose_for_nav:
+        params += list(pose_net.parameters())
+    optimizer = optim.AdamW(params, lr=lr, weight_decay=weight_decay)
     ckpt = os.path.join(ckpt_dir, "navigator.pth")
     if os.path.exists(ckpt):
         navigator.load_state_dict(torch.load(ckpt))
         print("[Navigator] 发现已有最佳模型，跳过训练")
         return
 
-    if not use_gt_pose:
+    if use_joint_pose_for_nav:
+        pose_net.train()
+    elif not use_gt_pose_for_nav:
         pose_net.eval()
     best_loss = float("inf")
     for ep in range(epochs):
@@ -91,26 +103,27 @@ def train_navigator_with_pose(pose_net, navigator, train_loader, val_loader, use
         total = 0.0
         cnt = 0
         for batch in train_loader:
-            if use_gt_pose:
+            if use_gt_pose_for_nav:
                 xb, yb_len, yb_dp, yb_ori = batch
                 with torch.no_grad():
                     R_abs = quat_to_rotmat(yb_ori)
                     xb_global = rotate_imu(xb, R_abs)
+            elif use_joint_pose_for_nav:
+                xb, yb_len, yb_dp, yb_ori, yb_rel = batch
+                R_delta = pose_net(xb)
+                q_anchor = quat_mul(quat_conj(yb_rel), yb_ori)
+                R_anchor = quat_to_rotmat(q_anchor)
+                R_abs = torch.matmul(R_anchor, R_delta)
+                xb_global = rotate_imu(xb, R_abs)
             else:
                 xb, yb_len, yb_dp, seq_id, init_rot = batch
                 with torch.no_grad():
                     R_delta = pose_net(xb)
                     R_abs = accumulate_rotations(R_delta, seq_id, init_rot)
                     xb_global = rotate_imu(xb, R_abs)
-            pred_len, pred_h, _, pred_dp = navigator(xb_global)
+            pred_dp = navigator(xb_global)
             loss_dp = F.mse_loss(pred_dp, yb_dp)
-            loss_len = F.mse_loss(pred_len, yb_len)
-            gt_h = torch.atan2(yb_dp[:, 1], yb_dp[:, 0])
-            diff_h = wrap_angle_torch(pred_h.squeeze(-1) - gt_h)
-            mask = (yb_len.squeeze(-1) > heading_len_eps).float().to(device)
-            loss_head = ((diff_h ** 2) * mask).sum() / (mask.sum() + 1e-8)
-            w_len, w_head, w_dp = navigator.normalized_loss_weights()
-            loss = w_dp * loss_dp + w_len * loss_len + w_head * loss_head
+            loss = w_dp_fixed * loss_dp
 
             optimizer.zero_grad()
             loss.backward()
@@ -127,24 +140,25 @@ def train_navigator_with_pose(pose_net, navigator, train_loader, val_loader, use
         cnt_val = 0
         with torch.no_grad():
             for batch in val_loader:
-                if use_gt_pose:
+                if use_gt_pose_for_nav:
                     xb, yb_len, yb_dp, yb_ori = batch
                     R_abs = quat_to_rotmat(yb_ori)
+                    xb_global = rotate_imu(xb, R_abs)
+                elif use_joint_pose_for_nav:
+                    xb, yb_len, yb_dp, yb_ori, yb_rel = batch
+                    R_delta = pose_net(xb)
+                    q_anchor = quat_mul(quat_conj(yb_rel), yb_ori)
+                    R_anchor = quat_to_rotmat(q_anchor)
+                    R_abs = torch.matmul(R_anchor, R_delta)
                     xb_global = rotate_imu(xb, R_abs)
                 else:
                     xb, yb_len, yb_dp, seq_id, init_rot = batch
                     R_delta = pose_net(xb)
                     R_abs = accumulate_rotations(R_delta, seq_id, init_rot)
                     xb_global = rotate_imu(xb, R_abs)
-                pred_len, pred_h, _, pred_dp = navigator(xb_global)
+                pred_dp = navigator(xb_global)
                 loss_dp = F.mse_loss(pred_dp, yb_dp)
-                loss_len = F.mse_loss(pred_len, yb_len)
-                gt_h = torch.atan2(yb_dp[:, 1], yb_dp[:, 0])
-                diff_h = wrap_angle_torch(pred_h.squeeze(-1) - gt_h)
-                mask = (yb_len.squeeze(-1) > heading_len_eps).float().to(device)
-                loss_head = ((diff_h ** 2) * mask).sum() / (mask.sum() + 1e-8)
-                w_len, w_head, w_dp = navigator.normalized_loss_weights()
-                vloss = w_dp * loss_dp + w_len * loss_len + w_head * loss_head
+                vloss = w_dp_fixed * loss_dp
                 bs = xb.size(0)
                 total_val += vloss.item() * bs
                 cnt_val += bs
@@ -153,9 +167,7 @@ def train_navigator_with_pose(pose_net, navigator, train_loader, val_loader, use
             best_loss = val_loss
             torch.save(navigator.state_dict(), ckpt)
         if (ep + 1) % 5 == 0 or ep == 0:
-            w_len, w_head, w_dp = navigator.normalized_loss_weights()
             print(f"[Navigator Ep {ep+1}] Loss: {avg_loss:.4f} | Val MSE: {val_loss:.4f} | "
-                  f"W(len={w_len.item():.2f}, head={w_head.item():.2f}, dp={w_dp.item():.2f}) | "
                   f"Time: {time.time()-t0:.1f}s")
 
 
@@ -165,13 +177,16 @@ def main():
     print("=" * 60)
     print("PoseNet + Navigator (RIDI only)")
     print("=" * 60)
+    if use_gt_pose_for_nav and use_joint_pose_for_nav:
+        raise ValueError("use_gt_pose_for_nav and use_joint_pose_for_nav cannot both be True.")
 
     print("\n📊 加载训练数据...")
     (x_tr, ylen_tr, yhead_tr, ydp_tr, yori_tr, yrel_tr, seq_tr, init_tr,
      x_va, ylen_va, yhead_va, ydp_va, yori_va, yrel_va, seq_va, init_va) = load_data_2d_ridi_absheading(
         ridi_root, device, window_size, stride,
         return_ori=True, return_rel_ori=True, return_seq=True, return_init=True,
-        return_delta_p=True, use_abs_heading=False
+        return_delta_p=True, use_abs_heading=False,
+        smooth_heading=smooth_heading_labels, heading_sigma=heading_sigma
     )
 
     print(f"训练集: {x_tr.shape[0]} 样本")
@@ -182,7 +197,10 @@ def main():
     nav_train_dataset = TensorDataset(x_tr, ylen_tr, ydp_tr, seq_tr, init_tr)
     nav_val_dataset = TensorDataset(x_va, ylen_va, ydp_va, seq_va, init_va)
 
-    if use_gt_pose:
+    if use_joint_pose_for_nav:
+        nav_train_dataset = TensorDataset(x_tr, ylen_tr, ydp_tr, yori_tr, yrel_tr)
+        nav_val_dataset = TensorDataset(x_va, ylen_va, ydp_va, yori_va, yrel_va)
+    elif use_gt_pose_for_nav:
         nav_train_dataset = TensorDataset(x_tr, ylen_tr, ydp_tr, yori_tr)
         nav_val_dataset = TensorDataset(x_va, ylen_va, ydp_va, yori_va)
 
@@ -192,17 +210,24 @@ def main():
     nav_val_loader = DataLoader(nav_val_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
 
     in_ch = x_tr.shape[-1]
-    pose_net = PoseNet(imu_dim=6, hidden_dim=128).to(device)
+    pose_net = PoseNetTransformer(imu_dim=6, d_model=128, nhead=4, num_layers=2, dim_feedforward=256).to(device)
     navigator = Navigator(imu_dim=in_ch, feat_dim=feat_dim).to(device)
 
-    if use_gt_pose:
-        print("\n🎯 使用真值姿态训练 Navigator（跳过 PoseNet）")
-    else:
+    if train_pose:
         print("\n🎯 训练 PoseNet")
         train_pose_net(pose_net, pose_train_loader, pose_val_loader)
+    else:
+        print("\n🎯 跳过 PoseNet 训练")
 
     print("\n🎯 训练 Navigator")
-    train_navigator_with_pose(pose_net, navigator, nav_train_loader, nav_val_loader, use_gt_pose=use_gt_pose)
+    train_navigator_with_pose(
+        pose_net,
+        navigator,
+        nav_train_loader,
+        nav_val_loader,
+        use_gt_pose_for_nav=use_gt_pose_for_nav,
+        use_joint_pose_for_nav=use_joint_pose_for_nav,
+    )
 
     print("\n✅ 训练完成")
     print(f"   检查点保存在: {ckpt_dir}")

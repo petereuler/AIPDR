@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -56,6 +57,20 @@ def quat_to_rotmat(q):
     )
 
 
+def quat_conj(q):
+    return torch.stack([q[:, 0], -q[:, 1], -q[:, 2], -q[:, 3]], dim=1)
+
+
+def quat_mul(q1, q2):
+    w1, x1, y1, z1 = q1[:, 0], q1[:, 1], q1[:, 2], q1[:, 3]
+    w2, x2, y2, z2 = q2[:, 0], q2[:, 1], q2[:, 2], q2[:, 3]
+    w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+    x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+    y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+    z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+    return torch.stack([w, x, y, z], dim=1)
+
+
 def rotate_imu(imu_seq, R_pred):
     """
     imu_seq: [B, T, 6] (gyro, acc) in body frame
@@ -83,5 +98,47 @@ class PoseNet(nn.Module):
         _, h = self.gru(imu_seq)
         h = h[-1]
         rot_6d = self.fc(h)
+        R_pred = compute_rotation_matrix_from_6d(rot_6d)
+        return R_pred
+
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe)
+
+    def forward(self, x):
+        return x + self.pe[:x.size(1), :].unsqueeze(0)
+
+
+class PoseNetTransformer(nn.Module):
+    """
+    Transformer-based pose estimator. Input: [B, T, 6], Output: [B, 3, 3].
+    """
+    def __init__(self, imu_dim=6, d_model=128, nhead=4, num_layers=2, dim_feedforward=256, dropout=0.1):
+        super().__init__()
+        self.input_proj = nn.Linear(imu_dim, d_model)
+        self.pos_encoder = PositionalEncoding(d_model)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.fc = nn.Linear(d_model, 6)
+
+    def forward(self, imu_seq):
+        x = self.input_proj(imu_seq)
+        x = self.pos_encoder(x)
+        x = self.transformer_encoder(x)
+        x_mean = x.mean(dim=1)
+        rot_6d = self.fc(x_mean)
         R_pred = compute_rotation_matrix_from_6d(rot_6d)
         return R_pred
