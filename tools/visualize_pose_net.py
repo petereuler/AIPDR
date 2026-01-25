@@ -1,249 +1,253 @@
 import os
 import sys
-from typing import Tuple
-
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 
+# 添加项目根目录到路径
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from data.dataset_RIDI import load_ridi_raw, window_dataset as ridi_window
-from utils.results import reconstruct_from_absolute_angles
+from data.dataset_RIDI import load_ridi_raw, window_dataset as ridi_window, yaw_from_quat
 from models.pose_net import PoseNetTransformer, quat_to_rotmat
+from utils.results import reconstruct_from_absolute_angles
 
+# ======= 基础工具函数 =======
 
 def rotmat_to_euler_xyz(R: torch.Tensor) -> torch.Tensor:
-    """
-    Convert rotation matrix to Euler angles (roll, pitch, yaw) in XYZ order.
-    R: (B, 3, 3)
-    returns: (B, 3) in radians
-    """
-    r00 = R[:, 0, 0]
-    r10 = R[:, 1, 0]
-    r20 = R[:, 2, 0]
-    r21 = R[:, 2, 1]
-    r22 = R[:, 2, 2]
-
+    r00, r10, r20 = R[:, 0, 0], R[:, 1, 0], R[:, 2, 0]
+    r21, r22 = R[:, 2, 1], R[:, 2, 2]
     pitch = torch.asin(torch.clamp(-r20, -1.0, 1.0))
     roll = torch.atan2(r21, r22)
     yaw = torch.atan2(r10, r00)
     return torch.stack([roll, pitch, yaw], dim=1)
 
-
-def yaw_from_quat(q: np.ndarray) -> np.ndarray:
-    w = q[:, 0]
-    x = q[:, 1]
-    y = q[:, 2]
-    z = q[:, 3]
-    return np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
-
 def wrap_angle(x: np.ndarray) -> np.ndarray:
     return (x + np.pi) % (2 * np.pi) - np.pi
 
+def unwrap_rad(x):
+    x = np.array(x, dtype=np.float32).reshape(-1)
+    return np.unwrap(x)
 
-def load_ridi_sequence(ridi_root: str, seq_name: str, window_size: int, stride: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def load_ridi_sequence(ridi_root: str, seq_name: str, window_size: int, stride: int):
     seq_dir = os.path.join(ridi_root, "data", seq_name)
     if not os.path.isdir(seq_dir):
-        raise FileNotFoundError(f"Sequence not found: {seq_dir}")
+        return None
+    
+    # 1. 加载原始数据
     gyro, acc, pos3d, ori = load_ridi_raw(seq_dir)
-    [gx, ax], [dl, _, abs_h, y_rel], init_pos, _ = ridi_window(
-        gyro, acc, pos3d, ori,
-        mode="2d",
-        window_size=window_size,
-        stride=stride,
-        filter_window=20,
-        smooth_heading=True,
-        heading_sigma=1.5,
-        smooth_length=False,
-        length_sigma=1.0,
-        return_abs_heading=True,
-        return_rel_ori=True,
-        align_heading_to_init_pose=True,
-    )
+    
+    # 2. 切分窗口
+    try:
+        # y_rel 就是 stride 期间的相对旋转
+        [gx, ax], [dl, _, abs_h, y_rel], init_pos, _ = ridi_window(
+            gyro, acc, pos3d, ori,
+            mode="2d", window_size=window_size, stride=stride,
+            filter_window=20, smooth_heading=True, heading_sigma=1.5,
+            return_abs_heading=True, return_rel_ori=True, align_heading_to_init_pose=True
+        )
+    except Exception as e:
+        print(f"Error processing {seq_name}: {e}")
+        return None
+
     x = np.concatenate([gx, ax], axis=-1)
-    return x, y_rel, abs_h, dl, init_pos, ori
-
-
-def pick_first_test_sequence(ridi_root: str) -> str:
-    test_list = os.path.join(ridi_root, "data", "list_test_publish_v2.txt")
-    if not os.path.exists(test_list):
-        raise FileNotFoundError(f"Missing test list: {test_list}")
-    with open(test_list, "r") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            return line.split(",")[0]
-    raise RuntimeError("No valid entries found in test list.")
-
-
-def main():
-    ridi_root = "/home/admin407/code/zyshe/NavCorrector/RIDI"
-    ckpt = "/home/admin407/code/zyshe/NavCorrector/checkpoints_cls/pose_net.pth"
-    out_dir = "/home/admin407/code/zyshe/NavCorrector/output"
-    max_n = 2000
-    seq = ""
-    window_size = 320
-    stride = 64
-
-    seq = seq or pick_first_test_sequence(ridi_root)
-    x, y_rel, abs_h, dl, init_pos, ori = load_ridi_sequence(ridi_root, seq, window_size, stride)
-    if x.shape[0] == 0:
-        raise RuntimeError("No windows produced. Check window_size/stride.")
-
-    x = x[:max_n]
-    y_rel = y_rel[:max_n]
-    abs_h = abs_h[:max_n]
-    dl = dl[:max_n]
-
-    # Sanity check: label self-MAE should be ~0
-    diff = abs_h - abs_h
-    diff = (diff + np.pi) % (2 * np.pi) - np.pi
-    label_mae = np.degrees(np.mean(np.abs(diff)))
-    print(f"[Label Check] abs_heading_gt self MAE: {label_mae:.6f} deg")
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    pose_net = PoseNetTransformer(imu_dim=6, d_model=128, nhead=4, num_layers=2, dim_feedforward=256).to(device)
-    if not os.path.exists(ckpt):
-        raise FileNotFoundError(f"PoseNet checkpoint not found: {ckpt}")
-    pose_net.load_state_dict(torch.load(ckpt, map_location=device))
-    pose_net.eval()
-
-    xb = torch.tensor(x, dtype=torch.float32, device=device)
-    with torch.no_grad():
-        R_pred = pose_net(xb)
-
-    q_rel = torch.tensor(y_rel, dtype=torch.float32, device=device)
-    R_gt = quat_to_rotmat(q_rel)
-
-    euler_pred = rotmat_to_euler_xyz(R_pred).cpu().numpy()
-    euler_gt = rotmat_to_euler_xyz(R_gt).cpu().numpy()
-
-    # Gravity alignment sanity: rotate local acc by predicted pose
-    acc_local = xb[:, :, 3:6]
-    R_pred_t = R_pred.transpose(1, 2)
-    acc_global_pred = torch.matmul(acc_local, R_pred_t)
-    acc_global_pred_mean = acc_global_pred.mean(dim=1).cpu().numpy()
-    z_pred = acc_global_pred_mean[:, 2]
-    print(f"[Gravity Check] pred acc_global z: mean={z_pred.mean():.4f}, std={z_pred.std():.4f}")
-
-    R_gt_t = R_gt.transpose(1, 2)
-    acc_global_gt = torch.matmul(acc_local, R_gt_t)
-    acc_global_gt_mean = acc_global_gt.mean(dim=1).cpu().numpy()
-    z_gt = acc_global_gt_mean[:, 2]
-    print(f"[Gravity Check] gt   acc_global z: mean={z_gt.mean():.4f}, std={z_gt.std():.4f}")
-
-    t = np.arange(euler_pred.shape[0])
-    deg = 180.0 / np.pi
-    labels = ["roll", "pitch", "yaw"]
-
-    fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
-    for i in range(3):
-        axes[i].plot(t, euler_gt[:, i] * deg, label="gt")
-        axes[i].plot(t, euler_pred[:, i] * deg, label="pred", alpha=0.8)
-        axes[i].set_ylabel(labels[i] + " (deg)")
-        axes[i].grid(True, alpha=0.3)
-        if i == 0:
-            axes[i].legend()
-    axes[-1].set_xlabel("window index")
-    fig.suptitle(f"PoseNet Relative Euler: {seq}")
-
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, f"pose_net_euler_{seq}.png")
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=150)
-    print(f"Saved: {out_path}")
-
-    # Absolute heading vs accumulated yaw
-    gyro, acc, _, _ = load_ridi_raw(os.path.join(ridi_root, "data", seq))
+    
+    # 对齐长度
+    # 手动计算对应的索引，确保真值对齐
     max_start = gyro.shape[0] - window_size - 1
     b_indices = []
     for idx in range(0, max_start, stride):
         b = idx + window_size // 2 + stride // 2
         b = max(0, min(b, len(ori) - 1))
         b_indices.append(b)
-    b_indices = np.array(b_indices, dtype=np.int64)
-    if b_indices.size > 0:
-        b_indices = b_indices[:abs_h.shape[0]]
-        q_seq = ori[b_indices].astype(np.float32)
-        yaw_ori = yaw_from_quat(q_seq)
-        R_ori = quat_to_rotmat(torch.tensor(q_seq, dtype=torch.float32))
-        yaw_ori_b2w = rotmat_to_euler_xyz(R_ori)[:, 2].cpu().numpy()
-        yaw_ori_w2b = rotmat_to_euler_xyz(R_ori.transpose(1, 2))[:, 2].cpu().numpy()
+    
+    min_len = min(len(y_rel), len(b_indices))
+    if min_len == 0:
+        return None
 
-        init_q = ori[b_indices[0]].astype(np.float32)
-        init_rot = quat_to_rotmat(torch.tensor(init_q[None, :], dtype=torch.float32)).squeeze(0)
-        yaw0_b2w = float(np.arctan2(init_rot[1, 0].item(), init_rot[0, 0].item()))
-        R_abs = []
-        current = init_rot
-        for i in range(R_pred.size(0)):
-            current = current @ R_pred[i].cpu()
-            R_abs.append(current)
-        R_abs = torch.stack(R_abs, dim=0)
-        yaw_pred_abs = rotmat_to_euler_xyz(R_abs)[:, 2].cpu().numpy()
-        abs_h = wrap_angle(abs_h - yaw0_b2w)
-        yaw_pred_abs = wrap_angle(yaw_pred_abs - yaw0_b2w)
-        yaw_ori = wrap_angle(yaw_ori - yaw0_b2w)
-        yaw_ori_b2w = wrap_angle(yaw_ori_b2w - yaw0_b2w)
-        yaw_ori_w2b = wrap_angle(yaw_ori_w2b - yaw0_b2w)
+    x = x[:min_len]
+    y_rel = y_rel[:min_len]
+    abs_h = abs_h[:min_len]
+    dl = dl[:min_len]
+    ori_seq = ori[b_indices[:min_len]]
 
-        n = min(len(dl), len(yaw_pred_abs))
-        traj_pred_pose = reconstruct_from_absolute_angles(init_pos, dl[:n], yaw_pred_abs[:n])
-        traj_gt_pose = reconstruct_from_absolute_angles(init_pos, dl[:n], abs_h[:n].reshape(-1))
-        fig3, ax3 = plt.subplots(1, 1, figsize=(5, 5))
-        ax3.plot(traj_gt_pose[:, 0], traj_gt_pose[:, 1], linewidth=1.5, label="traj_gt_abs_heading")
-        ax3.plot(traj_pred_pose[:, 0], traj_pred_pose[:, 1], linewidth=1.2, label="traj_pose_pred_yaw_gt_len")
-        ax3.axis("equal")
-        ax3.grid(True, alpha=0.3)
-        ax3.legend()
-        fig3.suptitle(f"Trajectory from PoseNet yaw + GT length: {seq}")
-        out_path3 = os.path.join(out_dir, f"pose_net_traj_pose_pred_gt_len_{seq}.png")
-        plt.tight_layout()
-        plt.savefig(out_path3, dpi=150)
-        print(f"Saved: {out_path3}")
+    return x, y_rel, abs_h, dl, init_pos, ori_seq
 
-    def unwrap_rad(x):
-        x = np.array(x, dtype=np.float32).reshape(-1)
-        return np.unwrap(x)
+# ======= 三大绘图函数 =======
 
-    fig2, ax2 = plt.subplots(1, 1, figsize=(10, 4))
-    colors = {
-        "abs_heading_gt": "#1f77b4",
-        "yaw_pred_abs": "#ff7f0e",
-        "yaw_gt_from_ori": "#2ca02c",
-        "yaw_gt_b2w": "#d62728",
-        "yaw_gt_w2b": "#9467bd",
-    }
-    abs_h_u = unwrap_rad(abs_h[:len(t)].flatten())
-    yaw_pred_u = unwrap_rad(yaw_pred_abs[:len(t)])
-    yaw_ori_u = unwrap_rad(yaw_ori[:len(t)])
-    yaw_b2w_u = unwrap_rad(yaw_ori_b2w[:len(t)])
-    yaw_w2b_u = unwrap_rad(yaw_ori_w2b[:len(t)])
-
-    ax2.plot(t[:len(abs_h_u)], abs_h_u * deg,
-             label="abs_heading_gt", color=colors["abs_heading_gt"])
-    ax2.plot(t[:len(yaw_pred_u)], yaw_pred_u * deg,
-             label="yaw_pred_abs", color=colors["yaw_pred_abs"], alpha=0.85)
-    ax2.plot(t[:len(yaw_ori_u)], yaw_ori_u * deg,
-             label="yaw_gt_from_ori", color=colors["yaw_gt_from_ori"], alpha=0.7)
-    ax2.plot(t[:len(yaw_b2w_u)], yaw_b2w_u * deg,
-             label="yaw_gt_b2w", color=colors["yaw_gt_b2w"], alpha=0.7)
-    ax2.plot(t[:len(yaw_w2b_u)], yaw_w2b_u * deg,
-             label="yaw_gt_w2b", color=colors["yaw_gt_w2b"], alpha=0.7)
-    ax2.set_ylabel("yaw (deg)")
-    ax2.set_xlabel("window index")
-    ax2.grid(True, alpha=0.3)
-    ax2.legend()
-    fig2.suptitle(f"Absolute Heading vs Pose Yaw: {seq}")
-
-    out_path2 = os.path.join(out_dir, f"pose_net_abs_yaw_{seq}.png")
+def plot_relative_euler(R_pred, R_gt, out_dir, seq_name):
+    """图1: 相对欧拉角对比 (检查 PoseNet 单步预测能力)"""
+    euler_pred = rotmat_to_euler_xyz(R_pred).cpu().numpy()
+    euler_gt = rotmat_to_euler_xyz(R_gt).cpu().numpy()
+    
+    t = np.arange(euler_pred.shape[0])
+    deg = 180.0 / np.pi
+    labels = ["Roll", "Pitch", "Yaw"]
+    
+    fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+    for i in range(3):
+        axes[i].plot(t, euler_gt[:, i] * deg, label="GT (Stride)", linewidth=2, alpha=0.6)
+        axes[i].plot(t, euler_pred[:, i] * deg, label="Pred (Stride)", linestyle="--", alpha=0.8)
+        axes[i].set_ylabel(f"{labels[i]} (deg)")
+        axes[i].grid(True, alpha=0.3)
+        if i == 0: axes[i].legend(loc="upper right")
+    
+    axes[-1].set_xlabel("Window Index (Stride Steps)")
+    fig.suptitle(f"Relative Rotation (Per Stride): {seq_name}")
     plt.tight_layout()
-    plt.savefig(out_path2, dpi=150)
-    print(f"Saved: {out_path2}")
+    plt.savefig(os.path.join(out_dir, f"{seq_name}_1_rel.png"), dpi=100)
+    plt.close()
 
+def plot_trajectory_comparison(init_pos, dl, yaw_pred_abs, yaw_gt_motion, out_dir, seq_name):
+    """图2: 轨迹重建对比 (Pred Yaw + GT Len vs GT Traj)"""
+    traj_pred = reconstruct_from_absolute_angles(init_pos, dl, yaw_pred_abs)
+    traj_gt = reconstruct_from_absolute_angles(init_pos, dl, yaw_gt_motion)
+    
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.plot(traj_gt[:, 0], traj_gt[:, 1], label="GT Trajectory", linewidth=2, color="black", alpha=0.6)
+    ax.plot(traj_pred[:, 0], traj_pred[:, 1], label="Pred Yaw + GT Len", linewidth=1.5, color="orange", linestyle="--")
+    
+    ax.axis("equal")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    ax.set_title(f"Trajectory Reconstruction: {seq_name}")
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, f"{seq_name}_2_traj.png"), dpi=100)
+    plt.close()
+
+def plot_heading_analysis(yaw_phone_gt, yaw_phone_pred, heading_motion_gt, out_dir, seq_name):
+    """图3: 航向角分析 (Accumulated Pose Yaw vs Motion Heading)"""
+    t = np.arange(len(yaw_phone_gt))
+    deg = 180.0 / np.pi
+    
+    # 解缠绕 (Unwrap) 以观察长期漂移趋势
+    u_phone_gt = unwrap_rad(yaw_phone_gt)
+    u_phone_pred = unwrap_rad(yaw_phone_pred)
+    u_motion_gt = unwrap_rad(heading_motion_gt)
+    
+    fig, ax = plt.subplots(figsize=(12, 6))
+    
+    # 1. 真实运动方向 (走路方向)
+    ax.plot(t, u_motion_gt * deg, label="Motion Heading (GT)", color="#1f77b4", linestyle="--", linewidth=2)
+    # 2. 真实手机姿态 (手机朝向)
+    ax.plot(t, u_phone_gt * deg, label="Phone Yaw (GT)", color="#2ca02c", alpha=0.6, linewidth=2)
+    # 3. 预测手机姿态 (PoseNet 积分结果)
+    ax.plot(t, u_phone_pred * deg, label="Phone Yaw (Pred Accumulated)", color="#ff7f0e", alpha=0.8, linewidth=1.5)
+    
+    ax.set_ylabel("Accumulated Yaw (deg)")
+    ax.set_xlabel("Window Index")
+    ax.set_title(f"Heading Analysis: {seq_name}\n(Drift Check)")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, f"{seq_name}_3_head.png"), dpi=100)
+    plt.close()
+
+
+# ======= 主流程 =======
+
+def main():
+    # 配置
+    ridi_root = "/home/admin407/code/zyshe/NavCorrector/RIDI"
+    ckpt_path = "/home/admin407/code/zyshe/NavCorrector/checkpoints_cls/pose_net.pth"
+    out_dir = "/home/admin407/code/zyshe/NavCorrector/output_all"
+    os.makedirs(out_dir, exist_ok=True)
+    
+    # 参数必须与训练一致
+    WINDOW_SIZE = 320
+    STRIDE = 64
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
+    # 1. 加载模型
+    print("Loading PoseNet...")
+    pose_net = PoseNetTransformer(imu_dim=6, d_model=128).to(device)
+    if os.path.exists(ckpt_path):
+        pose_net.load_state_dict(torch.load(ckpt_path, map_location=device))
+        print("Checkpoint loaded.")
+    else:
+        print("Error: Checkpoint not found! Using random weights.")
+    pose_net.eval()
+
+    # 2. 获取测试列表
+    test_list_path = os.path.join(ridi_root, "data", "list_test_publish_v2.txt")
+    if not os.path.exists(test_list_path):
+        print(f"Test list not found at {test_list_path}")
+        return
+
+    with open(test_list_path, "r") as f:
+        seq_names = [line.strip().split(",")[0] for line in f if line.strip()]
+    
+    print(f"Found {len(seq_names)} test sequences.")
+    
+    # 统计数据
+    global_z_stats = []
+    
+    # 3. 循环处理所有文件
+    for seq_name in tqdm(seq_names, desc="Processing"):
+        data = load_ridi_sequence(ridi_root, seq_name, window_size=WINDOW_SIZE, stride=STRIDE)
+        if data is None:
+            continue
+            
+        x, y_rel, abs_h_gt, dl, init_pos, ori_gt_seq = data
+        xb = torch.tensor(x, dtype=torch.float32, device=device)
+        
+        # 推理
+        with torch.no_grad():
+            R_pred_rel = pose_net(xb) # [B, 3, 3] Stride 旋转
+        
+        # 准备数据: 相对旋转真值
+        q_rel_gt = torch.tensor(y_rel, dtype=torch.float32, device=device)
+        R_gt_rel = quat_to_rotmat(q_rel_gt)
+        
+        # --- 重力对齐统计 (Gravity Check) ---
+        acc_local = xb[:, :, 3:6]
+        # 使用预测的 stride 旋转可能会有一点偏差，但大体能看出来
+        # 这里更严谨应该用 Anchor Mode 的绝对姿态，但简单起见用相对旋转看均值
+        acc_global_pred = torch.matmul(acc_local, R_pred_rel.transpose(1, 2))
+        z_pred = acc_global_pred.mean(dim=1)[:, 2].cpu().numpy()
+        global_z_stats.append(np.std(z_pred))
+        
+        # --- 积分绝对姿态 (Accumulation) ---
+        # 逻辑：R_next = R_curr @ R_stride_pred
+        # 这是一个连续的积分过程，会展现累积漂移
+        
+        init_q = ori_gt_seq[0]
+        init_R = quat_to_rotmat(torch.tensor(init_q[None, :], dtype=torch.float32)).to(device).squeeze(0)
+        
+        R_abs_list = []
+        curr_R = init_R
+        for i in range(len(R_pred_rel)):
+            # 核心累积行：连续左乘（假设 PoseNet 预测的是 Local Delta）
+            # 或者右乘？trainc.py 里是 R_anchor @ R_delta，意味着 R_delta 是 Local (Body Frame)
+            curr_R = curr_R @ R_pred_rel[i]
+            R_abs_list.append(curr_R)
+        R_abs_tensor = torch.stack(R_abs_list, dim=0)
+        
+        yaw_phone_pred = rotmat_to_euler_xyz(R_abs_tensor)[:, 2].cpu().numpy()
+        yaw_phone_gt = yaw_from_quat(ori_gt_seq).flatten()
+        heading_motion_gt = abs_h_gt.flatten()
+        
+        # 对齐初始值 (归零起点，方便对比走势)
+        yaw0 = yaw_phone_gt[0]
+        yaw_phone_pred = wrap_angle(yaw_phone_pred - yaw0)
+        yaw_phone_gt = wrap_angle(yaw_phone_gt - yaw0)
+        heading_motion_gt = wrap_angle(heading_motion_gt - heading_motion_gt[0])
+        
+        # === 生成三张图 ===
+        plot_relative_euler(R_pred_rel, R_gt_rel, out_dir, seq_name)
+        plot_trajectory_comparison(init_pos, dl, yaw_phone_pred, heading_motion_gt, out_dir, seq_name)
+        plot_heading_analysis(yaw_phone_gt, yaw_phone_pred, heading_motion_gt, out_dir, seq_name)
+
+    print("\n" + "="*50)
+    print("ANALYSIS COMPLETE")
+    print(f"Output Directory: {out_dir}")
+    print(f"Average Gravity Z Std: {np.mean(global_z_stats):.4f}")
+    print("="*50)
 
 if __name__ == "__main__":
     main()

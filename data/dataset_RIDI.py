@@ -230,7 +230,7 @@ def window_dataset(gyro_data, acc_data, pos_data, ori_data, mode="2d",
             if return_rel_ori:
                 qa = ori_data[a].astype(np.float32)
                 qb = ori_data[b].astype(np.float32)
-                q_rel = quat_mul(qb, quat_conj(qa))
+                q_rel = quat_mul(quat_conj(qa), qb)
                 y_rel.append(q_rel)
 
         x_gyro = np.array(x_gyro)
