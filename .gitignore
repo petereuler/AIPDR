@@ -13,6 +13,7 @@
 !models/**
 !src/**
 !utils/**
+!tools/**
 
 # Allow core python files
 !analyze_smoothness.py
