@@ -71,6 +71,58 @@ def quat_mul(q1, q2):
     return torch.stack([w, x, y, z], dim=1)
 
 
+def rotmat_to_quat(R):
+    """
+    Rotation matrix [B, 3, 3] -> quaternion (w, x, y, z).
+    """
+    r00 = R[:, 0, 0]
+    r01 = R[:, 0, 1]
+    r02 = R[:, 0, 2]
+    r10 = R[:, 1, 0]
+    r11 = R[:, 1, 1]
+    r12 = R[:, 1, 2]
+    r20 = R[:, 2, 0]
+    r21 = R[:, 2, 1]
+    r22 = R[:, 2, 2]
+
+    q = torch.zeros((R.size(0), 4), device=R.device, dtype=R.dtype)
+    t = r00 + r11 + r22
+
+    mask = t > 0.0
+    if mask.any():
+        s = torch.sqrt(t[mask] + 1.0) * 2.0
+        q[mask, 0] = 0.25 * s
+        q[mask, 1] = (r21[mask] - r12[mask]) / s
+        q[mask, 2] = (r02[mask] - r20[mask]) / s
+        q[mask, 3] = (r10[mask] - r01[mask]) / s
+
+    mask1 = (~mask) & (r00 > r11) & (r00 > r22)
+    if mask1.any():
+        s = torch.sqrt(1.0 + r00[mask1] - r11[mask1] - r22[mask1]) * 2.0
+        q[mask1, 0] = (r21[mask1] - r12[mask1]) / s
+        q[mask1, 1] = 0.25 * s
+        q[mask1, 2] = (r01[mask1] + r10[mask1]) / s
+        q[mask1, 3] = (r02[mask1] + r20[mask1]) / s
+
+    mask2 = (~mask) & (~mask1) & (r11 > r22)
+    if mask2.any():
+        s = torch.sqrt(1.0 + r11[mask2] - r00[mask2] - r22[mask2]) * 2.0
+        q[mask2, 0] = (r02[mask2] - r20[mask2]) / s
+        q[mask2, 1] = (r01[mask2] + r10[mask2]) / s
+        q[mask2, 2] = 0.25 * s
+        q[mask2, 3] = (r12[mask2] + r21[mask2]) / s
+
+    mask3 = (~mask) & (~mask1) & (~mask2)
+    if mask3.any():
+        s = torch.sqrt(1.0 + r22[mask3] - r00[mask3] - r11[mask3]) * 2.0
+        q[mask3, 0] = (r10[mask3] - r01[mask3]) / s
+        q[mask3, 1] = (r02[mask3] + r20[mask3]) / s
+        q[mask3, 2] = (r12[mask3] + r21[mask3]) / s
+        q[mask3, 3] = 0.25 * s
+
+    return q / (q.norm(dim=1, keepdim=True) + 1e-8)
+
+
 def rotate_imu(imu_seq, R_pred):
     """
     imu_seq: [B, T, 6] (gyro, acc) in body frame

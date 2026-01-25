@@ -6,6 +6,7 @@
 !models/
 !src/
 !utils/
+!tools/
 
 # Allow files inside these directories
 !data/**

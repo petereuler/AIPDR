@@ -3,16 +3,15 @@ import numpy as np
 import torch
 
 from data.dataset_RIDI import load_ridi_raw, window_dataset as ridi_window
-from models.pose_net import PoseNetTransformer, quat_to_rotmat, rotate_imu
+from models.pose_net import PoseNetTransformer, rotate_imu
 from models.navigator import Navigator
 from utils.navigator_pipeline import accumulate_rotations, compute_init_rot
 from utils.visualization import plot_trajectory_comparison, plot_time_series, plot_cumulative_series
 
 
-window_size = 160
-stride = 32
+window_size = 320
+stride = 64
 batch_size = 256
-use_gt_pose = False
 
 project_dir = "/home/admin407/code/zyshe/NavCorrector"
 ridi_root = os.path.join(project_dir, "RIDI")
@@ -24,35 +23,28 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
 
-def predict_navigator_batches(pose_net, navigator, gx, ax, seq_id, init_rot, use_gt_pose=False, yori=None):
+def predict_navigator_batches(pose_net, navigator, gx, ax, seq_id, init_rot):
     n = gx.shape[0]
-    preds_dp = []
+    preds_yaw = []
 
-    if not use_gt_pose:
-        pose_net.eval()
+    pose_net.eval()
     navigator.eval()
     with torch.no_grad():
         for start in range(0, n, batch_size):
             end = min(start + batch_size, n)
             xb = torch.tensor(np.concatenate([gx[start:end], ax[start:end]], axis=-1),
                               dtype=torch.float32, device=device)
-            if use_gt_pose:
-                if yori is None:
-                    raise ValueError("use_gt_pose=True requires yori.")
-                yb_ori = torch.tensor(yori[start:end], dtype=torch.float32, device=device)
-                R_abs = quat_to_rotmat(yb_ori)
-                xb_global = rotate_imu(xb, R_abs)
-            else:
-                sid = seq_id[start:end]
-                irot = init_rot[start:end]
-                R_delta = pose_net(xb)
-                R_abs = accumulate_rotations(R_delta, sid, irot)
-                xb_global = rotate_imu(xb, R_abs)
-            pred_dp = navigator(xb_global)
-            preds_dp.append(pred_dp.cpu().numpy())
+            sid = seq_id[start:end]
+            irot = init_rot[start:end]
+            R_delta = pose_net(xb)
+            R_abs = accumulate_rotations(R_delta, sid, irot)
+            xb_global = rotate_imu(xb, R_abs)
+            pred_out = navigator(xb_global)
+            yaw = torch.atan2(R_abs[:, 1, 0], R_abs[:, 0, 0])
+            preds_yaw.append(yaw.cpu().numpy())
 
-    pred_dp = np.concatenate(preds_dp, axis=0)
-    return pred_dp
+    pred_yaw = np.concatenate(preds_yaw, axis=0).reshape(-1)
+    return pred_yaw
 
 
 def build_traj_from_delta_p(init_pos, dp):
@@ -69,9 +61,8 @@ def main():
     pose_net = None
     navigator = Navigator(imu_dim=6, feat_dim=64).to(device)
 
-    if not use_gt_pose:
-        pose_net = PoseNetTransformer(imu_dim=6, d_model=128, nhead=4, num_layers=2, dim_feedforward=256).to(device)
-        pose_net.load_state_dict(torch.load(pose_ckpt, map_location=device))
+    pose_net = PoseNetTransformer(imu_dim=6, d_model=128, nhead=4, num_layers=2, dim_feedforward=256).to(device)
+    pose_net.load_state_dict(torch.load(pose_ckpt, map_location=device))
     navigator.load_state_dict(torch.load(nav_ckpt, map_location=device))
 
     test_list = os.path.join(ridi_root, "data", "list_test_publish_v2.txt")
@@ -84,7 +75,7 @@ def main():
             continue
         gyro, acc, pos3d, ori = load_ridi_raw(seq_dir)
 
-        [gx, ax], [dl, dh, yabs, yori, yrel, ydp], init_pos, init_head = ridi_window(
+        [gx, ax], [dl, dh, _yabs, ydp], init_pos, init_head = ridi_window(
             gyro, acc, pos3d, ori,
             mode="2d",
             window_size=window_size,
@@ -93,34 +84,29 @@ def main():
             smooth_heading=False,
             smooth_length=False,
             return_abs_heading=True,
-            return_ori=True,
-            return_rel_ori=True,
             return_delta_p=True,
         )
         if gx.shape[0] == 0:
             continue
 
-        if use_gt_pose:
-            init_rot = None
-            seq_id = None
-        else:
-            init_rot_np = compute_init_rot(ori, pos3d, window_size, stride)
-            init_rot = torch.tensor(init_rot_np, dtype=torch.float32, device=device)
-            seq_id = torch.zeros(gx.shape[0], dtype=torch.int64, device=device)
+        init_rot_np = compute_init_rot(ori, pos3d, window_size, stride)
+        init_rot = torch.tensor(init_rot_np, dtype=torch.float32, device=device)
+        seq_id = torch.zeros(gx.shape[0], dtype=torch.int64, device=device)
 
-        pred_dp = predict_navigator_batches(
-            pose_net, navigator, gx, ax, seq_id, init_rot, use_gt_pose=use_gt_pose, yori=yori
+        pred_yaw_pose = predict_navigator_batches(
+            pose_net, navigator, gx, ax, seq_id, init_rot
         )
 
         gt_traj = build_traj_from_delta_p(init_pos, ydp[:, :2])
-        pred_traj = build_traj_from_delta_p(init_pos, pred_dp[:, :2])
+        dxy_pose = np.stack([np.cos(pred_yaw_pose), np.sin(pred_yaw_pose)], axis=1) * dl.reshape(-1, 1)
+        pred_traj = build_traj_from_delta_p(init_pos, dxy_pose)
 
         gt_len = dl.reshape(-1)
-        pred_len = np.linalg.norm(pred_dp[:, :2], axis=1)
+        pred_len = dl.reshape(-1)
         len_mae = np.abs(pred_len - gt_len).mean()
 
         gt_head = np.arctan2(ydp[:, 1], ydp[:, 0])
-        pred_head = np.arctan2(pred_dp[:, 1], pred_dp[:, 0])
+        pred_head = pred_yaw_pose
         diff = (pred_head - gt_head + np.pi) % (2 * np.pi) - np.pi
         head_mae = np.abs(diff).mean()
 
