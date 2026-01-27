@@ -8,6 +8,7 @@
 !utils/
 !tools/
 
+
 # Allow files inside these directories
 !data/**
 !models/**
@@ -16,7 +17,6 @@
 !tools/**
 
 # Allow core python files
-!analyze_smoothness.py
 !trainc.py
 !testc.py
 

@@ -5,26 +5,25 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
-from models.pose_net import PoseNetTransformer, quat_conj, quat_mul, rotate_imu, rotmat_to_quat, quat_to_rotmat
+from models.pose_net import PoseNetTransformer, rotmat_to_quat, quat_conj, quat_mul, quat_to_rotmat
 from models.navigator import Navigator
 from utils.training_utils import load_data_2d_ridi_absheading
 
 # ======= 参数设置 =======
-window_size = 320   # 约 1.6s ~ 3.2s，取决于采样率，保证覆盖一个步态
+window_size = 320   # 约 1.6s ~ 3.2s
 stride = 64
-batch_size = 64
+batch_size = 8
 feat_dim = 64
 
 # 优化器参数
 lr = 1e-4
 weight_decay = 1e-4
 epochs = 200
-pose_epochs = 200
+pose_epochs = 20
+nav_epochs = 200
+joint_epochs = 50
 
-# 物理常量
-GRAVITY = 9.81  # 重力加速度 m/s^2
-
-# 路径设置 (请根据你的实际路径修改)
+# 路径设置
 project_dir = "/home/admin407/code/zyshe/NavCorrector"
 ridi_root = os.path.join(project_dir, "RIDI")
 ckpt_dir = os.path.join(project_dir, "checkpoints_cls")
@@ -34,37 +33,40 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
 
-# ======= 工具函数：去重力 =======
-
-def remove_gravity(acc_raw, q_gt):
+def rotate_imu_by_matrix(imu_seq, R_mat):
     """
-    从原始加速度中扣除重力，得到线性加速度。
-    acc_raw: [B, T, 3] (Body Frame)
-    q_gt: [B, T, 4] (Body -> World Orientation, scalar last/first depending on format)
-          这里假设 q_gt 是 RIDI 格式，我们在 dataset 里处理过可能是 wxyz
-    Returns:
-        acc_linear: [B, T, 3]
+    使用旋转矩阵序列旋转 IMU 数据
+    imu_seq: [B, T, 3] or [B, T, 6]
+    R_mat: [B, 3, 3] (整个窗口共用一个旋转) 或 [B, T, 3, 3]
     """
-    # 1. 构造世界系重力向量 [0, 0, 9.81]
-    batch_size, seq_len, _ = acc_raw.shape
-    g_world = torch.tensor([0.0, 0.0, GRAVITY], device=acc_raw.device).view(1, 1, 3)
-    g_world = g_world.expand(batch_size, seq_len, 3)
+    # 简单起见，假设 R_mat 是 [B, 3, 3]，即窗口的参考姿态
+    # 如果 imu_seq 是 [B, T, 6] (gyro+acc)，我们通常只旋转 acc 和 gyro 向量
+    # 这里我们分开处理
+    batch_size, seq_len, dim = imu_seq.shape
     
-    # 2. 将重力转到 Body Frame: g_body = R_world2body @ g_world
-    # R_world2body 就是 q_gt 的共轭 (如果 q_gt 是 Body->World)
-    # 假设 models.pose_net.quat_to_rotmat 接受的是 [w, x, y, z]
-    # 需要先将 q_gt reshape 成 [B*T, 4] 处理再变回来
-    q_flat = q_gt.reshape(-1, 4)
-    R_b2w = quat_to_rotmat(q_flat) # [B*T, 3, 3]
-    R_w2b = R_b2w.transpose(1, 2)
+    # 扩展 R_mat 到 [B, T, 3, 3]
+    if R_mat.dim() == 3:
+        R_seq = R_mat.unsqueeze(1).expand(batch_size, seq_len, 3, 3)
+    else:
+        R_seq = R_mat
+        
+    R_seq_flat = R_seq.reshape(-1, 3, 3)
+    imu_flat = imu_seq.reshape(-1, dim)
     
-    g_world_flat = g_world.reshape(-1, 3).unsqueeze(-1) # [B*T, 3, 1]
-    g_body_flat = torch.matmul(R_w2b, g_world_flat).squeeze(-1) # [B*T, 3]
-    g_body = g_body_flat.view(batch_size, seq_len, 3)
-    
-    # 3. 扣除重力
-    acc_linear = acc_raw - g_body
-    return acc_linear
+    if dim == 3:
+        # 只旋转 3D 向量
+        imu_rot = torch.matmul(R_seq_flat, imu_flat.unsqueeze(-1)).squeeze(-1)
+    elif dim == 6:
+        # 分别旋转 Gyro (0:3) 和 Acc (3:6)
+        gyro = imu_flat[:, 0:3]
+        acc = imu_flat[:, 3:6]
+        gyro_rot = torch.matmul(R_seq_flat, gyro.unsqueeze(-1)).squeeze(-1)
+        acc_rot = torch.matmul(R_seq_flat, acc.unsqueeze(-1)).squeeze(-1)
+        imu_rot = torch.cat([gyro_rot, acc_rot], dim=1)
+    else:
+        raise ValueError("Unsupported IMU dim")
+        
+    return imu_rot.view(batch_size, seq_len, dim)
 
 
 # ======= 训练函数 =======
@@ -74,7 +76,6 @@ def train_pose_net(pose_net, train_loader):
     optimizer = optim.AdamW(pose_net.parameters(), lr=lr, weight_decay=weight_decay)
     ckpt = os.path.join(ckpt_dir, "pose_net.pth")
     
-    # 如果有预训练模型可以选择加载，这里为了演示保留训练逻辑
     if os.path.exists(ckpt):
         print(f"[Pose] 发现检查点 {ckpt}，尝试加载...")
         try:
@@ -83,7 +84,25 @@ def train_pose_net(pose_net, train_loader):
         except:
             print("[Pose] 加载失败，重新训练")
 
+    # 初始化 best_loss 为当前模型在训练集上的loss，确保从已训权重继续改进
     best_loss = float("inf")
+    pose_net.eval()
+    with torch.no_grad():
+        total = 0.0
+        cnt = 0
+        for batch in train_loader:
+            xb, yb_rel = batch[0], batch[1]
+            R_pred = pose_net(xb)
+            q_pred = rotmat_to_quat(R_pred)
+            q_gt = yb_rel / (yb_rel.norm(dim=1, keepdim=True) + 1e-8)
+            dot = torch.abs(torch.sum(q_pred * q_gt, dim=1))
+            loss = torch.mean(1.0 - dot * dot)
+            bs = xb.size(0)
+            total += loss.item() * bs
+            cnt += bs
+        if cnt > 0:
+            best_loss = total / cnt
+    pose_net.train()
     print(f"[Pose] 开始训练... (Epochs: {pose_epochs})")
     
     for ep in range(pose_epochs):
@@ -91,17 +110,16 @@ def train_pose_net(pose_net, train_loader):
         pose_net.train()
         total = 0.0
         cnt = 0
-        # PoseNet 只需要 xb (raw imu) 和 yb_rel (相对旋转真值)
         for batch in train_loader:
             xb, yb_rel = batch[0], batch[1]
             
+            # PoseNet 预测相对姿态
             R_pred = pose_net(xb)
             q_pred = rotmat_to_quat(R_pred)
             
-            # 简单的余弦距离 Loss
             q_gt = yb_rel / (yb_rel.norm(dim=1, keepdim=True) + 1e-8)
             dot = torch.abs(torch.sum(q_pred * q_gt, dim=1))
-            loss = torch.mean(1.0 - dot * dot) # 1 - cos^2
+            loss = torch.mean(1.0 - dot * dot)
             
             optimizer.zero_grad()
             loss.backward()
@@ -121,97 +139,83 @@ def train_pose_net(pose_net, train_loader):
             print(f"[Pose Ep {ep+1}] Loss: {avg_loss:.6f} | Time: {time.time()-t0:.1f}s")
 
 
-def train_navigator_corrected(pose_net, navigator, train_loader, val_loader):
+def train_navigator_corrected(
+    pose_net,
+    navigator,
+    train_loader,
+    val_loader,
+    joint_finetune=False,
+    pose_lr_scale=0.1,
+    num_epochs=None,
+    phase_name="Navigator",
+):
     """
-    Stage 2: 训练 Navigator (Core Modification)
-    策略：
-    1. 去重力 (Using GT Orientation for clean input)
-    2. 坐标系对齐 (Using PoseNet Prediction)
-    3. 残差学习 (Target is inverse-rotated displacement)
+    Stage 2: 训练 Navigator (修复坐标系对齐)
+    改进点：
+    1. 使用 q_start (yb_init) 作为绝对锚点。
+    2. R_abs = R_init @ R_rel (PoseNet预测)。
+    3. 将 Linear Acc 旋转到 R_abs 定义的世界系。
     """
-    optimizer = optim.AdamW(navigator.parameters(), lr=lr, weight_decay=weight_decay)
+    if joint_finetune:
+        optimizer = optim.AdamW(
+            [
+                {"params": navigator.parameters(), "lr": lr},
+                {"params": pose_net.parameters(), "lr": lr * pose_lr_scale},
+            ],
+            weight_decay=weight_decay,
+        )
+    else:
+        optimizer = optim.AdamW(navigator.parameters(), lr=lr, weight_decay=weight_decay)
     ckpt = os.path.join(ckpt_dir, "navigator.pth")
     
-    pose_net.eval() # 固定 PoseNet
+    if joint_finetune:
+        pose_net.train()
+    else:
+        pose_net.eval()
     
     best_loss = float("inf")
-    print(f"\n[Navigator] 开始训练... (Epochs: {epochs})")
+    num_epochs = epochs if num_epochs is None else num_epochs
+    print(f"\n[{phase_name}] 开始训练... (Epochs: {num_epochs})")
 
-    for ep in range(epochs):
-        t0 = time.time()
+    for ep in range(num_epochs):
         navigator.train()
         total_train_loss = 0.0
         train_cnt = 0
         
         for batch in train_loader:
-            # Unpack data
-            # xb: Raw IMU [B, T, 6] (Gyro, Acc)
-            # yb_dp: GT Displacement World [B, 3] (dx, dy, dz)
-            # yb_ori: GT Orientation Sequence [B, T, 4] (用于去重力)
-            xb, yb_dp, yb_ori = batch
+            # xb: Raw IMU
+            # yb_dp: GT Displacement (Global Frame)
+            # yb_ori: GT Orientation at window end (For Gravity Removal / Anchor)
+            # yb_rel: GT Relative Orientation (qa^-1 * qb)
+            xb, yb_dp, yb_ori, yb_rel, yb_align = batch
             
             acc_raw = xb[:, :, 3:6]
             gyro_raw = xb[:, :, 0:3]
             
-            # --- Step 1: 物理去重力 (Physics-based Preprocessing) ---
-            # 使用真值姿态去重力，保证输入给 Navigator 的是纯净的运动加速度
-            # (在 Inference 时，这一步可以使用 PoseNet 的预测姿态，或者互补滤波结果)
-            with torch.no_grad():
-                acc_linear = remove_gravity(acc_raw, yb_ori)
-            
-            # 构造去重力后的 IMU 序列 (Gyro 不变, Acc 变了)
-            xb_linear = torch.cat([gyro_raw, acc_linear], dim=2)
+            # --- Step 1: 使用线性加速度（数据集提供） ---
+            xb_linear = torch.cat([gyro_raw, acc_raw], dim=2)
 
-            # --- Step 2: 获取 PoseNet 预测的姿态基准 ---
-            with torch.no_grad():
-                # R_pred: [B, 3, 3] (Body -> World at the end/center of window)
-                # 注意：PoseNet 的输入依然是 Raw IMU (xb)，因为它需要重力向量来校准水平面
-                R_pred = pose_net(xb) 
+            # --- Step 2: 绝对坐标系对齐 (Per-window anchor) ---
+            if joint_finetune:
+                R_rel = pose_net(xb)
+            else:
+                with torch.no_grad():
+                    R_rel = pose_net(xb)
+            # 从 qb 和 q_rel 还原 qa 作为锚点: qa = conj(q_rel) * qb
+            q_anchor = quat_mul(quat_conj(yb_rel), yb_ori)
+            R_anchor = quat_to_rotmat(q_anchor)
+            R_abs_est = torch.matmul(R_anchor, R_rel)
 
-            # --- Step 3: 坐标系对齐 (Coordinate Alignment) ---
-            # 将 Linear Acc 旋转到 "PoseNet 预测的世界系"
-            # xb_aligned: [B, T, 6]
-            xb_aligned = rotate_imu(xb_linear, R_pred)
+            # 3. 将 Linear Acc 旋转到 "估计的世界系"
+            # 这样 Navigator 看到的加速度是 Global Frame 下的 (North, East, Up)
+            R_abs_aligned = torch.matmul(yb_align, R_abs_est)
+            xb_aligned = rotate_imu_by_matrix(xb_linear, R_abs_aligned)
             
-            # --- Step 4: 制作训练标签 (Label Engineering) ---
-            # 核心思想：把真值位移 (World) 逆向旋转回 PoseNet 的局部系
-            # 这样 Navigator 只需要学习 "在 PoseNet 姿态基础上的修正量"
-            
-            # 构造 3D 位移向量 (确保维度正确)
-            # yb_dp 是 [B, 3]
-            dp_world = yb_dp.unsqueeze(-1) # [B, 3, 1]
-            
-            # 逆旋转: R_pred^T @ dp_world
-            # 结果 dp_local 代表：在 PoseNet 认为的"前方"坐标系下，人实际走了多少
-            dp_local = torch.matmul(R_pred.transpose(1, 2), dp_world).squeeze(-1) # [B, 3]
-            
-            # 提取水平面目标 (XY)
-            target_dx = dp_local[:, 0]
-            target_dy = dp_local[:, 1]
-            
-            # 转换为极坐标标签
-            target_speed = torch.sqrt(target_dx**2 + target_dy**2 + 1e-8).unsqueeze(1) # [B, 1]
-            target_cos = (target_dx / target_speed) # [B, 1]
-            target_sin = (target_dy / target_speed) # [B, 1]
+            # --- Step 3: Forward & Loss (world-frame dp) ---
+            pred_dp_aligned = navigator(xb_aligned)
+            pred_dp_world = torch.matmul(yb_align.transpose(1, 2), pred_dp_aligned.unsqueeze(-1)).squeeze(-1)
+            loss = F.mse_loss(pred_dp_world, yb_dp)
 
-            # --- Step 5: 网络前向与 Loss ---
-            # Navigator 输入是对齐后的 Linear IMU
-            pred_out = navigator(xb_aligned) # [B, 3] -> [cos, sin, speed]
-            
-            pred_cos = pred_out[:, 0:1]
-            pred_sin = pred_out[:, 1:2]
-            pred_speed = pred_out[:, 2:3]
-            
-            # Loss 设计
-            # 1. 方向 Loss (MSE on Cos/Sin)
-            loss_cos = F.mse_loss(pred_cos, target_cos)
-            loss_sin = F.mse_loss(pred_sin, target_sin)
-            
-            # 2. 速度 Loss (MSE on Speed)
-            loss_speed = F.mse_loss(pred_speed, target_speed)
-            
-            # 总 Loss
-            loss = loss_cos + loss_sin + loss_speed
             
             optimizer.zero_grad()
             loss.backward()
@@ -221,7 +225,7 @@ def train_navigator_corrected(pose_net, navigator, train_loader, val_loader):
             train_cnt += xb.size(0)
             total_train_loss += loss.item() * xb.size(0)
 
-        # --- Validation Loop (Similar logic) ---
+        # --- Validation ---
         avg_train_loss = total_train_loss / max(train_cnt, 1)
         
         navigator.eval()
@@ -230,68 +234,69 @@ def train_navigator_corrected(pose_net, navigator, train_loader, val_loader):
         
         with torch.no_grad():
             for batch in val_loader:
-                xb, yb_dp, yb_ori = batch
+                xb, yb_dp, yb_ori, yb_rel, yb_align = batch
                 
                 acc_raw = xb[:, :, 3:6]
                 gyro_raw = xb[:, :, 0:3]
-                acc_linear = remove_gravity(acc_raw, yb_ori)
-                xb_linear = torch.cat([gyro_raw, acc_linear], dim=2)
+                xb_linear = torch.cat([gyro_raw, acc_raw], dim=2)
                 
-                R_pred = pose_net(xb)
-                xb_aligned = rotate_imu(xb_linear, R_pred)
+                if joint_finetune:
+                    R_rel = pose_net(xb)
+                else:
+                    R_rel = pose_net(xb)
+                q_anchor = quat_mul(quat_conj(yb_rel), yb_ori)
+                R_anchor = quat_to_rotmat(q_anchor)
+                R_abs_est = torch.matmul(R_anchor, R_rel)
+                R_abs_aligned = torch.matmul(yb_align, R_abs_est)
+                xb_aligned = rotate_imu_by_matrix(xb_linear, R_abs_aligned)
                 
-                dp_world = yb_dp.unsqueeze(-1)
-                dp_local = torch.matmul(R_pred.transpose(1, 2), dp_world).squeeze(-1)
-                
-                t_dx, t_dy = dp_local[:, 0], dp_local[:, 1]
-                t_spd = torch.sqrt(t_dx**2 + t_dy**2 + 1e-8).unsqueeze(1)
-                t_cos, t_sin = t_dx/t_spd, t_dy/t_spd
-                
-                pred = navigator(xb_aligned)
-                v_loss = F.mse_loss(pred[:,0:1], t_cos) + \
-                         F.mse_loss(pred[:,1:2], t_sin) + \
-                         F.mse_loss(pred[:,2:3], t_spd)
+                pred_dp_aligned = navigator(xb_aligned)
+                pred_dp_world = torch.matmul(yb_align.transpose(1, 2), pred_dp_aligned.unsqueeze(-1)).squeeze(-1)
+                v_loss = F.mse_loss(pred_dp_world, yb_dp)
                          
                 total_val_loss += v_loss.item() * xb.size(0)
                 val_cnt += xb.size(0)
                 
         avg_val_loss = total_val_loss / max(val_cnt, 1)
         
-        # Save Best
         if avg_val_loss < best_loss:
             best_loss = avg_val_loss
             torch.save(navigator.state_dict(), ckpt)
             
         if (ep + 1) % 5 == 0 or ep == 0:
-            print(f"[Nav Ep {ep+1}] Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+            print(f"[{phase_name} Ep {ep+1}] Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
 
 # ======= 主流程 =======
 
 def main():
     print("=" * 60)
-    print("NavCorrector: PoseNet + Polar Navigator (with Gravity Removal)")
+    print("NavCorrector: PoseNet + Polar Navigator (Fixed Absolute Alignment)")
     print("=" * 60)
 
     # 1. 加载数据
-    # 注意：我们需要 return_ori=True 以便计算重力
-    # yb_rel 用于 PoseNet 训练，yb_dp 用于 Navigator 训练
     print("\n📊 加载训练数据...")
-    (x_tr, _ylen_tr, _yhead_tr, ydp_tr, yori_tr, yrel_tr,
-     x_va, _ylen_va, _yhead_va, ydp_va, yori_va, yrel_va) = load_data_2d_ridi_absheading(
+    # 修改：增加了 return_init=True 来获取每个窗口的初始绝对姿态
+    (x_tr, _ylen_tr, _yhead_tr, ydp_tr, yori_tr, yrel_tr, _yinit_tr, yalign_tr,
+     x_va, _ylen_va, _yhead_va, ydp_va, yori_va, yrel_va, _yinit_va, yalign_va) = load_data_2d_ridi_absheading(
         ridi_root, device, window_size, stride,
-        return_ori=True,        # 必须: 用于去重力
-        return_rel_ori=True,    # 必须: 用于 PoseNet 训练
-        return_delta_p=True,    # 必须: 用于 Navigator 训练
-        use_abs_heading=False
+        return_ori=True,        # 用于去重力
+        return_rel_ori=True,    # 用于 PoseNet 训练
+        return_delta_p=True,    # 用于 Navigator 训练标签
+        return_init=True,       # 新增：用于 Navigator 输入对齐 (绝对姿态锚点)
+        use_abs_heading=False,
+        align_init_quat=True,
+        align_init_quat_to_labels=False,
+        return_align=True,
+        acc_source="linacce"
     )
     
-    # PoseNet 数据集: (Input, Relative Rotation Label)
+    # PoseNet 数据集
     pose_dataset = TensorDataset(x_tr, yrel_tr)
     pose_loader = DataLoader(pose_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
     
-    # Navigator 数据集: (Input, Global Displacement, Orientation for Gravity)
-    nav_train_ds = TensorDataset(x_tr, ydp_tr, yori_tr)
-    nav_val_ds = TensorDataset(x_va, ydp_va, yori_va)
+    # Navigator 数据集 (新增 yinit_tr)
+    nav_train_ds = TensorDataset(x_tr, ydp_tr, yori_tr, yrel_tr, yalign_tr)
+    nav_val_ds = TensorDataset(x_va, ydp_va, yori_va, yrel_va, yalign_va)
     
     nav_train_loader = DataLoader(nav_train_ds, batch_size=batch_size, shuffle=True, drop_last=True)
     nav_val_loader = DataLoader(nav_val_ds, batch_size=batch_size, shuffle=False)
@@ -299,14 +304,35 @@ def main():
     # 2. 初始化模型
     in_ch = x_tr.shape[-1]
     pose_net = PoseNetTransformer(imu_dim=6, d_model=128).to(device)
-    # Navigator 输入维度还是 6 (Gyro + Linear Acc)，输出维度改为了 3
     navigator = Navigator(imu_dim=in_ch, feat_dim=feat_dim).to(device)
 
     # 3. 训练 PoseNet
     train_pose_net(pose_net, pose_loader)
 
-    # 4. 训练 Navigator (Corrected)
-    train_navigator_corrected(pose_net, navigator, nav_train_loader, nav_val_loader)
+    # 4. 训练 Navigator (Stage 2: Frozen PoseNet)
+    train_navigator_corrected(
+        pose_net,
+        navigator,
+        nav_train_loader,
+        nav_val_loader,
+        joint_finetune=False,
+        pose_lr_scale=0.1,
+        num_epochs=nav_epochs,
+        phase_name="Navigator-Stage2",
+    )
+
+    # 5. 训练 Navigator + PoseNet (Stage 3: Joint Finetune)
+    if joint_epochs > 0:
+        train_navigator_corrected(
+            pose_net,
+            navigator,
+            nav_train_loader,
+            nav_val_loader,
+            joint_finetune=True,
+            pose_lr_scale=0.1,
+            num_epochs=joint_epochs,
+            phase_name="Navigator-Stage3",
+        )
 
     print("\n✅ 训练完成")
 

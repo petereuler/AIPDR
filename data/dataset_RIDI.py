@@ -71,7 +71,7 @@ ORI_IS_W2B = False  # RIDI orientation is body->world
 POSE_ORDER = "xyzw"  # RIDI pose.txt quaternions are x, y, z, w (Tango), swap to wxyz
 
 
-def load_ridi_raw(seq_dir):
+def load_ridi_raw(seq_dir, acc_source="acce"):
     """
     加载 RIDI 原始数据：IMU(gyro/acc) 与 GT 位置/姿态。
 
@@ -85,7 +85,12 @@ def load_ridi_raw(seq_dir):
         ori_data: (N, 4)
     """
     gyro_path = os.path.join(seq_dir, "gyro.txt")
-    acc_path = os.path.join(seq_dir, "acce.txt")
+    if acc_source == "acce":
+        acc_path = os.path.join(seq_dir, "acce.txt")
+    elif acc_source == "linacce":
+        acc_path = os.path.join(seq_dir, "linacce.txt")
+    else:
+        raise ValueError(f"Unknown acc_source: {acc_source}")
     pose_path = os.path.join(seq_dir, "pose.txt")
     ori_path = os.path.join(seq_dir, "orientation.txt")
 
@@ -205,10 +210,7 @@ def window_dataset(gyro_data, acc_data, pos_data, ori_data, mode="2d",
                 else:
                     prev_p = pos2d[prev_a]
                     prev_diff = pa - prev_p
-                    if np.linalg.norm(prev_diff) < 1e-6:
-                        prev_chord_angle = curr_chord_angle
-                    else:
-                        prev_chord_angle = np.arctan2(prev_diff[1], prev_diff[0])
+                    prev_chord_angle = np.arctan2(prev_diff[1], prev_diff[0])
                     delta_head = wrap_angle(curr_chord_angle - prev_chord_angle)
 
             y_len.append(np.array([delta_len], dtype=np.float32))
@@ -246,10 +248,6 @@ def window_dataset(gyro_data, acc_data, pos_data, ori_data, mode="2d",
         if return_delta_p:
             y_dp = np.array(y_dp)
 
-        if len(y_len) > 0 and len(y_head) > 0:
-            stationary_mask = np.abs(y_len.flatten()) < 0.01
-            y_len[stationary_mask, 0] = 0.0
-            y_head[stationary_mask, 0] = 0.0
 
         if smooth_length and len(y_len) > 0:
             y_len_smooth = gaussian_filter1d(y_len.flatten(), sigma=length_sigma)

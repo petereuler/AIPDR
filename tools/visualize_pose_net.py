@@ -228,19 +228,23 @@ def main():
             R_abs_list.append(curr_R)
         R_abs_tensor = torch.stack(R_abs_list, dim=0)
         
-        yaw_phone_pred = rotmat_to_euler_xyz(R_abs_tensor)[:, 2].cpu().numpy()
-        yaw_phone_gt = yaw_from_quat(ori_gt_seq).flatten()
-        heading_motion_gt = abs_h_gt.flatten()
-        
+        yaw_phone_pred_raw = rotmat_to_euler_xyz(R_abs_tensor)[:, 2].cpu().numpy()
+        yaw_phone_gt_raw = yaw_from_quat(ori_gt_seq).flatten()
+        heading_motion_gt_raw = abs_h_gt.flatten()
+
+        # 轨迹重建：统一到运动方向标准（对齐初始航向）
+        yaw_offset = heading_motion_gt_raw[0] - yaw_phone_pred_raw[0]
+        yaw_pred_for_traj = wrap_angle(yaw_phone_pred_raw + yaw_offset)
+
         # 对齐初始值 (归零起点，方便对比走势)
-        yaw0 = yaw_phone_gt[0]
-        yaw_phone_pred = wrap_angle(yaw_phone_pred - yaw0)
-        yaw_phone_gt = wrap_angle(yaw_phone_gt - yaw0)
-        heading_motion_gt = wrap_angle(heading_motion_gt - heading_motion_gt[0])
+        yaw0 = yaw_phone_gt_raw[0]
+        yaw_phone_pred = wrap_angle(yaw_phone_pred_raw - yaw0)
+        yaw_phone_gt = wrap_angle(yaw_phone_gt_raw - yaw0)
+        heading_motion_gt = wrap_angle(heading_motion_gt_raw - heading_motion_gt_raw[0])
         
         # === 生成三张图 ===
         plot_relative_euler(R_pred_rel, R_gt_rel, out_dir, seq_name)
-        plot_trajectory_comparison(init_pos, dl, yaw_phone_pred, heading_motion_gt, out_dir, seq_name)
+        plot_trajectory_comparison(init_pos, dl, yaw_pred_for_traj, heading_motion_gt_raw, out_dir, seq_name)
         plot_heading_analysis(yaw_phone_gt, yaw_phone_pred, heading_motion_gt, out_dir, seq_name)
 
     print("\n" + "="*50)
