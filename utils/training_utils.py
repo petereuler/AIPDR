@@ -335,7 +335,7 @@ def load_data_2d_ridi(ridi_root, device, window_size=160, stride=32):
     return x_tr, ylen_tr, yhead_tr, x_va, ylen_va, yhead_va
 
 
-def load_data_2d_ridi_absheading(ridi_root, device, window_size=160, stride=32, return_ori=False, return_rel_ori=False, return_seq=False, return_init=False, return_delta_p=False, use_abs_heading=True, smooth_heading=False, heading_sigma=1.5, align_init_quat=False, acc_source="acce", align_init_quat_to_labels=True, return_align=False):
+def load_data_2d_ridi_absheading(ridi_root, device, window_size=160, stride=32, return_ori=False, return_rel_ori=False, return_seq=False, return_init=False, return_delta_p=False, use_abs_heading=True, smooth_heading=False, heading_sigma=1.5, align_init_quat=False, acc_source="acce", align_init_quat_to_labels=True, return_align=False, align_heading_to_init_pose=True):
     """
     加载 RIDI 数据集并分割为训练/验证，返回绝对航向标签
     """
@@ -442,7 +442,7 @@ def load_data_2d_ridi_absheading(ridi_root, device, window_size=160, stride=32, 
                 return_rel_ori=True,
                 return_delta_p=True,
                 abs_heading_from_ori=False,
-                align_heading_to_init_pose=True,
+                align_heading_to_init_pose=align_heading_to_init_pose,
             )
         elif return_rel_ori and return_delta_p:
             [gx, ax], [dl, y_head, abs_h, drel, dp], _, init_head = ridi_window(
@@ -459,7 +459,7 @@ def load_data_2d_ridi_absheading(ridi_root, device, window_size=160, stride=32, 
                 return_rel_ori=True,
                 return_delta_p=True,
                 abs_heading_from_ori=False,
-                align_heading_to_init_pose=True,
+                align_heading_to_init_pose=align_heading_to_init_pose,
             )
         elif return_rel_ori and return_ori:
             [gx, ax], [dl, y_head, abs_h, dori, drel], _, init_head = ridi_window(
@@ -476,7 +476,7 @@ def load_data_2d_ridi_absheading(ridi_root, device, window_size=160, stride=32, 
                 return_ori=True,
                 return_rel_ori=True,
                 abs_heading_from_ori=False,
-                align_heading_to_init_pose=True,
+                align_heading_to_init_pose=align_heading_to_init_pose,
             )
         elif return_rel_ori:
             [gx, ax], [dl, y_head, abs_h, drel], _, init_head = ridi_window(
@@ -492,7 +492,7 @@ def load_data_2d_ridi_absheading(ridi_root, device, window_size=160, stride=32, 
                 return_abs_heading=True,
                 return_rel_ori=True,
                 abs_heading_from_ori=False,
-                align_heading_to_init_pose=True,
+                align_heading_to_init_pose=align_heading_to_init_pose,
             )
         elif return_delta_p:
             [gx, ax], [dl, y_head, abs_h, dp], _, init_head = ridi_window(
@@ -508,7 +508,7 @@ def load_data_2d_ridi_absheading(ridi_root, device, window_size=160, stride=32, 
                 return_abs_heading=True,
                 return_delta_p=True,
                 abs_heading_from_ori=False,
-                align_heading_to_init_pose=True,
+                align_heading_to_init_pose=align_heading_to_init_pose,
             )
         else:
             [gx, ax], [dl, y_head, abs_h], _, init_head = ridi_window(
@@ -523,7 +523,7 @@ def load_data_2d_ridi_absheading(ridi_root, device, window_size=160, stride=32, 
             length_sigma=1.0,
             return_abs_heading=True,
             abs_heading_from_ori=False,
-            align_heading_to_init_pose=True,
+            align_heading_to_init_pose=align_heading_to_init_pose,
             )
 
         if align_init_quat_to_labels and align_init_quat and dp is not None and dp.shape[1] == 3:

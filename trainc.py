@@ -10,18 +10,19 @@ from models.navigator import Navigator
 from utils.training_utils import load_data_2d_ridi_absheading
 
 # ======= 参数设置 =======
-window_size = 320   # 约 1.6s ~ 3.2s
+window_size = 64   # 约 1.6s ~ 3.2s
 stride = 64
-batch_size = 8
+batch_size = 1024
 feat_dim = 64
 
 # 优化器参数
 lr = 1e-4
 weight_decay = 1e-4
 epochs = 200
-pose_epochs = 20
+pose_epochs = 500
 nav_epochs = 200
 joint_epochs = 50
+pose_output_mode = "quat"
 
 # 路径设置
 project_dir = "/home/admin407/code/zyshe/NavCorrector"
@@ -275,23 +276,37 @@ def main():
 
     # 1. 加载数据
     print("\n📊 加载训练数据...")
-    # 修改：增加了 return_init=True 来获取每个窗口的初始绝对姿态
+    # PoseNet: 使用带重力加速度 (acce)
+    (x_tr_pose, _ylen_tr_pose, _yhead_tr_pose, yrel_tr_pose,
+     x_va_pose, _ylen_va_pose, _yhead_va_pose, yrel_va_pose) = load_data_2d_ridi_absheading(
+        ridi_root, device, window_size, stride,
+        return_ori=False,
+        return_rel_ori=True,
+        return_delta_p=False,
+        return_init=False,
+        use_abs_heading=False,
+        acc_source="acce",
+        align_heading_to_init_pose=False,
+    )
+
+    # Navigator: 使用线性加速度 (linacce)
     (x_tr, _ylen_tr, _yhead_tr, ydp_tr, yori_tr, yrel_tr, _yinit_tr, yalign_tr,
      x_va, _ylen_va, _yhead_va, ydp_va, yori_va, yrel_va, _yinit_va, yalign_va) = load_data_2d_ridi_absheading(
         ridi_root, device, window_size, stride,
         return_ori=True,        # 用于去重力
         return_rel_ori=True,    # 用于 PoseNet 训练
         return_delta_p=True,    # 用于 Navigator 训练标签
-        return_init=True,       # 新增：用于 Navigator 输入对齐 (绝对姿态锚点)
+        return_init=True,       # 用于 Navigator 输入对齐 (绝对姿态锚点)
         use_abs_heading=False,
         align_init_quat=True,
         align_init_quat_to_labels=False,
         return_align=True,
-        acc_source="linacce"
+        acc_source="linacce",
+        align_heading_to_init_pose=False,
     )
     
     # PoseNet 数据集
-    pose_dataset = TensorDataset(x_tr, yrel_tr)
+    pose_dataset = TensorDataset(x_tr_pose, yrel_tr_pose)
     pose_loader = DataLoader(pose_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
     
     # Navigator 数据集 (新增 yinit_tr)
@@ -303,7 +318,7 @@ def main():
 
     # 2. 初始化模型
     in_ch = x_tr.shape[-1]
-    pose_net = PoseNetTransformer(imu_dim=6, d_model=128).to(device)
+    pose_net = PoseNetTransformer(imu_dim=6, d_model=128, output_mode=pose_output_mode).to(device)
     navigator = Navigator(imu_dim=in_ch, feat_dim=feat_dim).to(device)
 
     # 3. 训练 PoseNet

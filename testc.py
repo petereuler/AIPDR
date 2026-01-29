@@ -13,6 +13,7 @@ window_size = 320
 stride = 64
 batch_size = 256
 use_gt_pose = False
+pose_output_mode = "6d"
 
 project_dir = "/home/admin407/code/zyshe/NavCorrector"
 ridi_root = os.path.join(project_dir, "RIDI")
@@ -110,7 +111,14 @@ def main():
 
     pose_net = None
     if not use_gt_pose:
-        pose_net = PoseNetTransformer(imu_dim=6, d_model=128, nhead=4, num_layers=2, dim_feedforward=256).to(device)
+        pose_net = PoseNetTransformer(
+            imu_dim=6,
+            d_model=128,
+            nhead=4,
+            num_layers=2,
+            dim_feedforward=256,
+            output_mode=pose_output_mode,
+        ).to(device)
         pose_net.load_state_dict(torch.load(pose_ckpt, map_location=device))
     navigator.load_state_dict(torch.load(nav_ckpt, map_location=device))
 

@@ -171,8 +171,11 @@ class PositionalEncoding(nn.Module):
 class PoseNetTransformer(nn.Module):
     """
     Transformer-based pose estimator. Input: [B, T, 6], Output: [B, 3, 3].
+    output_mode:
+      - "6d": predict 6D rotation and orthogonalize to SO(3)
+      - "quat": predict quaternion and L2-normalize to unit quaternion
     """
-    def __init__(self, imu_dim=6, d_model=128, nhead=4, num_layers=2, dim_feedforward=256, dropout=0.1):
+    def __init__(self, imu_dim=6, d_model=128, nhead=4, num_layers=2, dim_feedforward=256, dropout=0.1, output_mode="6d"):
         super().__init__()
         self.input_proj = nn.Linear(imu_dim, d_model)
         self.pos_encoder = PositionalEncoding(d_model)
@@ -184,13 +187,21 @@ class PoseNetTransformer(nn.Module):
             batch_first=True,
         )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.fc = nn.Linear(d_model, 6)
+        self.output_mode = output_mode
+        if output_mode == "quat":
+            self.fc = nn.Linear(d_model, 4)
+        else:
+            self.fc = nn.Linear(d_model, 6)
 
     def forward(self, imu_seq):
         x = self.input_proj(imu_seq)
         x = self.pos_encoder(x)
         x = self.transformer_encoder(x)
         x_mean = x.mean(dim=1)
-        rot_6d = self.fc(x_mean)
-        R_pred = compute_rotation_matrix_from_6d(rot_6d)
+        if self.output_mode == "quat":
+            q_pred = F.normalize(self.fc(x_mean), dim=1, eps=1e-8)
+            R_pred = quat_to_rotmat(q_pred)
+        else:
+            rot_6d = self.fc(x_mean)
+            R_pred = compute_rotation_matrix_from_6d(rot_6d)
         return R_pred

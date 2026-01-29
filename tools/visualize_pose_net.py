@@ -46,7 +46,7 @@ def load_ridi_sequence(ridi_root: str, seq_name: str, window_size: int, stride: 
             gyro, acc, pos3d, ori,
             mode="2d", window_size=window_size, stride=stride,
             filter_window=20, smooth_heading=True, heading_sigma=1.5,
-            return_abs_heading=True, return_rel_ori=True, align_heading_to_init_pose=True
+            return_abs_heading=True, return_rel_ori=True, align_heading_to_init_pose=False
         )
     except Exception as e:
         print(f"Error processing {seq_name}: {e}")
@@ -147,6 +147,37 @@ def plot_heading_analysis(yaw_phone_gt, yaw_phone_pred, heading_motion_gt, out_d
     plt.close()
 
 
+def plot_absolute_euler(R_pred, R_gt, out_dir, seq_name):
+    """图4: 绝对欧拉角对比 (累积姿态, 对齐初始值)"""
+    euler_pred = rotmat_to_euler_xyz(R_pred).cpu().numpy()
+    euler_gt = rotmat_to_euler_xyz(R_gt).cpu().numpy()
+
+    if euler_pred.shape[0] == 0 or euler_gt.shape[0] == 0:
+        return
+
+    euler_pred = wrap_angle(euler_pred - euler_pred[0:1, :])
+    euler_gt = wrap_angle(euler_gt - euler_gt[0:1, :])
+
+    t = np.arange(euler_pred.shape[0])
+    deg = 180.0 / np.pi
+    labels = ["Roll", "Pitch", "Yaw"]
+
+    fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+    for i in range(3):
+        axes[i].plot(t, euler_gt[:, i] * deg, label="GT (Absolute)", linewidth=2, alpha=0.6)
+        axes[i].plot(t, euler_pred[:, i] * deg, label="Pred (Accumulated)", linestyle="--", alpha=0.8)
+        axes[i].set_ylabel(f"{labels[i]} (deg)")
+        axes[i].grid(True, alpha=0.3)
+        if i == 0:
+            axes[i].legend(loc="upper right")
+
+    axes[-1].set_xlabel("Window Index (Stride Steps)")
+    fig.suptitle(f"Absolute Rotation (Accumulated): {seq_name}")
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, f"{seq_name}_4_abs.png"), dpi=100)
+    plt.close()
+
+
 # ======= 主流程 =======
 
 def main():
@@ -157,15 +188,20 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     
     # 参数必须与训练一致
-    WINDOW_SIZE = 320
+    WINDOW_SIZE = 64
     STRIDE = 64
+    pose_output_mode = "quat"
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
     # 1. 加载模型
     print("Loading PoseNet...")
-    pose_net = PoseNetTransformer(imu_dim=6, d_model=128).to(device)
+    pose_net = PoseNetTransformer(
+        imu_dim=6,
+        d_model=128,
+        output_mode=pose_output_mode,
+    ).to(device)
     if os.path.exists(ckpt_path):
         pose_net.load_state_dict(torch.load(ckpt_path, map_location=device))
         print("Checkpoint loaded.")
@@ -232,20 +268,18 @@ def main():
         yaw_phone_gt_raw = yaw_from_quat(ori_gt_seq).flatten()
         heading_motion_gt_raw = abs_h_gt.flatten()
 
-        # 轨迹重建：统一到运动方向标准（对齐初始航向）
-        yaw_offset = heading_motion_gt_raw[0] - yaw_phone_pred_raw[0]
-        yaw_pred_for_traj = wrap_angle(yaw_phone_pred_raw + yaw_offset)
-
-        # 对齐初始值 (归零起点，方便对比走势)
-        yaw0 = yaw_phone_gt_raw[0]
-        yaw_phone_pred = wrap_angle(yaw_phone_pred_raw - yaw0)
-        yaw_phone_gt = wrap_angle(yaw_phone_gt_raw - yaw0)
-        heading_motion_gt = wrap_angle(heading_motion_gt_raw - heading_motion_gt_raw[0])
+        # 不对齐航向角，使用绝对姿态与原始运动航向
+        yaw_pred_for_traj = wrap_angle(yaw_phone_pred_raw)
+        yaw_phone_pred = wrap_angle(yaw_phone_pred_raw)
+        yaw_phone_gt = wrap_angle(yaw_phone_gt_raw)
+        heading_motion_gt = wrap_angle(heading_motion_gt_raw)
         
         # === 生成三张图 ===
         plot_relative_euler(R_pred_rel, R_gt_rel, out_dir, seq_name)
         plot_trajectory_comparison(init_pos, dl, yaw_pred_for_traj, heading_motion_gt_raw, out_dir, seq_name)
         plot_heading_analysis(yaw_phone_gt, yaw_phone_pred, heading_motion_gt, out_dir, seq_name)
+        R_abs_gt = quat_to_rotmat(torch.tensor(ori_gt_seq, dtype=torch.float32, device=device))
+        plot_absolute_euler(R_abs_tensor, R_abs_gt, out_dir, seq_name)
 
     print("\n" + "="*50)
     print("ANALYSIS COMPLETE")
