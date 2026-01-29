@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from models.pose_net import quat_to_rotmat
+
 
 class PhysicsAwareHeadingNet(nn.Module):
     """
@@ -13,28 +15,10 @@ class PhysicsAwareHeadingNet(nn.Module):
         super().__init__()
         self.imu_dim = imu_dim
         self.pose_gru = nn.GRU(input_size=imu_dim, hidden_size=pose_hidden, batch_first=True)
-        self.pose_fc = nn.Linear(pose_hidden, 6)
+        self.pose_fc = nn.Linear(pose_hidden, 4)
 
         self.heading_gru = nn.GRU(input_size=imu_dim, hidden_size=heading_hidden, batch_first=True)
         self.heading_fc = nn.Linear(heading_hidden, heading_out_dim)
-
-    @staticmethod
-    def compute_rotation_matrix_from_6d(x, eps=1e-8):
-        """
-        Zhou et al. 6D rotation representation -> SO(3) via Gram-Schmidt.
-        x: [B, 6]
-        returns: [B, 3, 3]
-        """
-        a1 = x[:, 0:3]
-        a2 = x[:, 3:6]
-
-        b1 = F.normalize(a1, dim=1, eps=eps)
-        dot = torch.sum(b1 * a2, dim=1, keepdim=True)
-        a2_ortho = a2 - dot * b1
-        b2 = F.normalize(a2_ortho, dim=1, eps=eps)
-        b3 = torch.cross(b1, b2, dim=1)
-
-        return torch.stack([b1, b2, b3], dim=2)
 
     def forward(self, imu_seq):
         """
@@ -47,8 +31,8 @@ class PhysicsAwareHeadingNet(nn.Module):
         # Pose stream
         _, h_pose = self.pose_gru(imu_seq)
         h_pose = h_pose[-1]
-        rot_6d = self.pose_fc(h_pose)
-        R_pred = self.compute_rotation_matrix_from_6d(rot_6d)
+        q_pred = F.normalize(self.pose_fc(h_pose), dim=1, eps=1e-8)
+        R_pred = quat_to_rotmat(q_pred)
 
         # Split IMU
         gyro_local = imu_seq[:, :, 0:3]

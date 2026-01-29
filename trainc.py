@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
-from models.pose_net import PoseNetTransformer, rotmat_to_quat, quat_conj, quat_mul, quat_to_rotmat
+from models.pose_net import PoseNetTransformer, rotmat_to_quat, quat_conj, quat_mul, quat_to_rotmat, quat_to_euler_xyz, euler_to_quat_xyz
 from models.navigator import Navigator
 from utils.training_utils import load_data_2d_ridi_absheading
 
@@ -19,10 +19,10 @@ feat_dim = 64
 lr = 1e-4
 weight_decay = 1e-4
 epochs = 200
-pose_epochs = 500
+pose_epochs = 50
 nav_epochs = 200
 joint_epochs = 50
-pose_output_mode = "quat"
+gyro_var_deg = 2.0
 
 # 路径设置
 project_dir = "/home/admin407/code/zyshe/NavCorrector"
@@ -69,6 +69,34 @@ def rotate_imu_by_matrix(imu_seq, R_mat):
         
     return imu_rot.view(batch_size, seq_len, dim)
 
+def integrate_gyro_rel(gyro_seq, dt):
+    bsz, tlen, _ = gyro_seq.shape
+    q = torch.zeros(bsz, 4, device=gyro_seq.device, dtype=gyro_seq.dtype)
+    q[:, 0] = 1.0
+    for t in range(tlen):
+        w = gyro_seq[:, t, :]
+        w_norm = torch.norm(w, dim=1, keepdim=True) + 1e-8
+        angle = w_norm * dt
+        axis = w / w_norm
+        half = 0.5 * angle
+        dq = torch.cat([torch.cos(half), axis * torch.sin(half)], dim=1)
+        q = quat_mul(q, dq)
+    return q / (q.norm(dim=1, keepdim=True) + 1e-8)
+
+def fuse_gyro_pose_euler(xb, pose_net, dt):
+    euler_pred, logvar = pose_net.forward_euler(xb)
+    q_gyro = integrate_gyro_rel(xb[:, :, 0:3], dt)
+    euler_gyro = quat_to_euler_xyz(q_gyro)
+    R = torch.exp(logvar)
+    P0 = (torch.tensor(gyro_var_deg, device=xb.device) * torch.pi / 180.0) ** 2
+    K = P0 / (P0 + R + 1e-8)
+    return euler_gyro + K * (euler_pred - euler_gyro)
+
+def fused_rotmat_from_gyro(xb, pose_net, dt):
+    fused = fuse_gyro_pose_euler(xb, pose_net, dt)
+    q_fused = euler_to_quat_xyz(fused[:, 0:1], fused[:, 1:2], fused[:, 2:3])
+    return quat_to_rotmat(q_fused)
+
 
 # ======= 训练函数 =======
 
@@ -93,11 +121,11 @@ def train_pose_net(pose_net, train_loader):
         cnt = 0
         for batch in train_loader:
             xb, yb_rel = batch[0], batch[1]
-            R_pred = pose_net(xb)
-            q_pred = rotmat_to_quat(R_pred)
+            fused = fuse_gyro_pose_euler(xb, pose_net, dt=1.0 / 200.0)
+            q_fused = euler_to_quat_xyz(fused[:, 0:1], fused[:, 1:2], fused[:, 2:3])
             q_gt = yb_rel / (yb_rel.norm(dim=1, keepdim=True) + 1e-8)
-            dot = torch.abs(torch.sum(q_pred * q_gt, dim=1))
-            loss = torch.mean(1.0 - dot * dot)
+            dot = torch.abs(torch.sum(q_fused * q_gt, dim=1))
+            loss = torch.mean(1.0 - dot)
             bs = xb.size(0)
             total += loss.item() * bs
             cnt += bs
@@ -113,14 +141,11 @@ def train_pose_net(pose_net, train_loader):
         cnt = 0
         for batch in train_loader:
             xb, yb_rel = batch[0], batch[1]
-            
-            # PoseNet 预测相对姿态
-            R_pred = pose_net(xb)
-            q_pred = rotmat_to_quat(R_pred)
-            
+            fused = fuse_gyro_pose_euler(xb, pose_net, dt=1.0 / 200.0)
+            q_fused = euler_to_quat_xyz(fused[:, 0:1], fused[:, 1:2], fused[:, 2:3])
             q_gt = yb_rel / (yb_rel.norm(dim=1, keepdim=True) + 1e-8)
-            dot = torch.abs(torch.sum(q_pred * q_gt, dim=1))
-            loss = torch.mean(1.0 - dot * dot)
+            dot = torch.abs(torch.sum(q_fused * q_gt, dim=1))
+            loss = torch.mean(1.0 - dot)
             
             optimizer.zero_grad()
             loss.backward()
@@ -193,29 +218,16 @@ def train_navigator_corrected(
             acc_raw = xb[:, :, 3:6]
             gyro_raw = xb[:, :, 0:3]
             
-            # --- Step 1: 使用线性加速度（数据集提供） ---
+            # --- Step 1: 使用线性加速度（数据集提供），保持在手机坐标系 ---
             xb_linear = torch.cat([gyro_raw, acc_raw], dim=2)
 
-            # --- Step 2: 绝对坐标系对齐 (Per-window anchor) ---
-            if joint_finetune:
-                R_rel = pose_net(xb)
-            else:
-                with torch.no_grad():
-                    R_rel = pose_net(xb)
-            # 从 qb 和 q_rel 还原 qa 作为锚点: qa = conj(q_rel) * qb
-            q_anchor = quat_mul(quat_conj(yb_rel), yb_ori)
-            R_anchor = quat_to_rotmat(q_anchor)
-            R_abs_est = torch.matmul(R_anchor, R_rel)
+            # --- Step 2: Navigator 直接预测手机坐标系下位移 ---
+            pred_dp_body = navigator(xb_linear)
 
-            # 3. 将 Linear Acc 旋转到 "估计的世界系"
-            # 这样 Navigator 看到的加速度是 Global Frame 下的 (North, East, Up)
-            R_abs_aligned = torch.matmul(yb_align, R_abs_est)
-            xb_aligned = rotate_imu_by_matrix(xb_linear, R_abs_aligned)
-            
-            # --- Step 3: Forward & Loss (world-frame dp) ---
-            pred_dp_aligned = navigator(xb_aligned)
-            pred_dp_world = torch.matmul(yb_align.transpose(1, 2), pred_dp_aligned.unsqueeze(-1)).squeeze(-1)
-            loss = F.mse_loss(pred_dp_world, yb_dp)
+            # --- Step 3: 用真值姿态把世界系位移旋回手机系作为监督 ---
+            R_abs_gt = quat_to_rotmat(yb_ori)
+            dp_body_gt = torch.matmul(R_abs_gt.transpose(1, 2), yb_dp.unsqueeze(-1)).squeeze(-1)
+            loss = F.mse_loss(pred_dp_body, dp_body_gt)
 
             
             optimizer.zero_grad()
@@ -242,7 +254,7 @@ def train_navigator_corrected(
                 xb_linear = torch.cat([gyro_raw, acc_raw], dim=2)
                 
                 if joint_finetune:
-                    R_rel = pose_net(xb)
+                    R_rel = fused_rotmat_from_gyro(xb, pose_net, dt=1.0 / 200.0)
                 else:
                     R_rel = pose_net(xb)
                 q_anchor = quat_mul(quat_conj(yb_rel), yb_ori)
@@ -251,9 +263,10 @@ def train_navigator_corrected(
                 R_abs_aligned = torch.matmul(yb_align, R_abs_est)
                 xb_aligned = rotate_imu_by_matrix(xb_linear, R_abs_aligned)
                 
-                pred_dp_aligned = navigator(xb_aligned)
-                pred_dp_world = torch.matmul(yb_align.transpose(1, 2), pred_dp_aligned.unsqueeze(-1)).squeeze(-1)
-                v_loss = F.mse_loss(pred_dp_world, yb_dp)
+                pred_dp_body = navigator(xb_linear)
+                R_abs_gt = quat_to_rotmat(yb_ori)
+                dp_body_gt = torch.matmul(R_abs_gt.transpose(1, 2), yb_dp.unsqueeze(-1)).squeeze(-1)
+                v_loss = F.mse_loss(pred_dp_body, dp_body_gt)
                          
                 total_val_loss += v_loss.item() * xb.size(0)
                 val_cnt += xb.size(0)
@@ -318,7 +331,7 @@ def main():
 
     # 2. 初始化模型
     in_ch = x_tr.shape[-1]
-    pose_net = PoseNetTransformer(imu_dim=6, d_model=128, output_mode=pose_output_mode).to(device)
+    pose_net = PoseNetTransformer(imu_dim=6, d_model=128).to(device)
     navigator = Navigator(imu_dim=in_ch, feat_dim=feat_dim).to(device)
 
     # 3. 训练 PoseNet

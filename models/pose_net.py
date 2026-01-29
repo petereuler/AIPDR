@@ -4,23 +4,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def compute_rotation_matrix_from_6d(x, eps=1e-8):
-    """
-    Zhou et al. 6D rotation representation -> SO(3) via Gram-Schmidt.
-    x: [B, 6]
-    returns: [B, 3, 3]
-    """
-    a1 = x[:, 0:3]
-    a2 = x[:, 3:6]
-
-    b1 = F.normalize(a1, dim=1, eps=eps)
-    dot = torch.sum(b1 * a2, dim=1, keepdim=True)
-    a2_ortho = a2 - dot * b1
-    b2 = F.normalize(a2_ortho, dim=1, eps=eps)
-    b3 = torch.cross(b1, b2, dim=1)
-
-    return torch.stack([b1, b2, b3], dim=2)
-
 
 def quat_to_rotmat(q):
     """
@@ -123,6 +106,36 @@ def rotmat_to_quat(R):
     return q / (q.norm(dim=1, keepdim=True) + 1e-8)
 
 
+def euler_to_quat_xyz(roll, pitch, yaw):
+    hr = roll * 0.5
+    hp = pitch * 0.5
+    hy = yaw * 0.5
+    cr, sr = torch.cos(hr), torch.sin(hr)
+    cp, sp = torch.cos(hp), torch.sin(hp)
+    cy, sy = torch.cos(hy), torch.sin(hy)
+    qw = cy * cp * cr + sy * sp * sr
+    qx = cy * cp * sr - sy * sp * cr
+    qy = cy * sp * cr + sy * cp * sr
+    qz = sy * cp * cr - cy * sp * sr
+    q = torch.cat([qw, qx, qy, qz], dim=1)
+    return q / (q.norm(dim=1, keepdim=True) + 1e-8)
+
+
+def quat_to_euler_xyz(q):
+    q = q / (q.norm(dim=1, keepdim=True) + 1e-8)
+    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    t0 = 2.0 * (w * x + y * z)
+    t1 = 1.0 - 2.0 * (x * x + y * y)
+    roll = torch.atan2(t0, t1)
+    t2 = 2.0 * (w * y - z * x)
+    t2 = torch.clamp(t2, -1.0, 1.0)
+    pitch = torch.asin(t2)
+    t3 = 2.0 * (w * z + x * y)
+    t4 = 1.0 - 2.0 * (y * y + z * z)
+    yaw = torch.atan2(t3, t4)
+    return torch.stack([roll, pitch, yaw], dim=1)
+
+
 def rotate_imu(imu_seq, R_pred):
     """
     imu_seq: [B, T, 6] (gyro, acc) in body frame
@@ -139,18 +152,18 @@ def rotate_imu(imu_seq, R_pred):
 
 class PoseNet(nn.Module):
     """
-    Estimate rotation matrix from IMU sequence using 6D rotation representation.
+    Estimate rotation matrix from IMU sequence using quaternion representation.
     """
     def __init__(self, imu_dim=6, hidden_dim=128):
         super().__init__()
         self.gru = nn.GRU(input_size=imu_dim, hidden_size=hidden_dim, batch_first=True)
-        self.fc = nn.Linear(hidden_dim, 6)
+        self.fc = nn.Linear(hidden_dim, 4)
 
     def forward(self, imu_seq):
         _, h = self.gru(imu_seq)
         h = h[-1]
-        rot_6d = self.fc(h)
-        R_pred = compute_rotation_matrix_from_6d(rot_6d)
+        q_pred = F.normalize(self.fc(h), dim=1, eps=1e-8)
+        R_pred = quat_to_rotmat(q_pred)
         return R_pred
 
 
@@ -171,11 +184,9 @@ class PositionalEncoding(nn.Module):
 class PoseNetTransformer(nn.Module):
     """
     Transformer-based pose estimator. Input: [B, T, 6], Output: [B, 3, 3].
-    output_mode:
-      - "6d": predict 6D rotation and orthogonalize to SO(3)
-      - "quat": predict quaternion and L2-normalize to unit quaternion
+    输出四元数 + 对应欧拉角的对数方差（用于融合）。
     """
-    def __init__(self, imu_dim=6, d_model=128, nhead=4, num_layers=2, dim_feedforward=256, dropout=0.1, output_mode="6d"):
+    def __init__(self, imu_dim=6, d_model=128, nhead=4, num_layers=2, dim_feedforward=256, dropout=0.1):
         super().__init__()
         self.input_proj = nn.Linear(imu_dim, d_model)
         self.pos_encoder = PositionalEncoding(d_model)
@@ -187,21 +198,29 @@ class PoseNetTransformer(nn.Module):
             batch_first=True,
         )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.output_mode = output_mode
-        if output_mode == "quat":
-            self.fc = nn.Linear(d_model, 4)
-        else:
-            self.fc = nn.Linear(d_model, 6)
+        # 4 for quaternion + 3 for euler log-variance
+        self.fc = nn.Linear(d_model, 7)
 
     def forward(self, imu_seq):
         x = self.input_proj(imu_seq)
         x = self.pos_encoder(x)
         x = self.transformer_encoder(x)
         x_mean = x.mean(dim=1)
-        if self.output_mode == "quat":
-            q_pred = F.normalize(self.fc(x_mean), dim=1, eps=1e-8)
-            R_pred = quat_to_rotmat(q_pred)
-        else:
-            rot_6d = self.fc(x_mean)
-            R_pred = compute_rotation_matrix_from_6d(rot_6d)
+        out = self.fc(x_mean)
+        q_pred = F.normalize(out[:, 0:4], dim=1, eps=1e-8)
+        R_pred = quat_to_rotmat(q_pred)
         return R_pred
+
+    def forward_euler(self, imu_seq):
+        """
+        返回: euler_pred, logvar (用于融合)
+        """
+        x = self.input_proj(imu_seq)
+        x = self.pos_encoder(x)
+        x = self.transformer_encoder(x)
+        x_mean = x.mean(dim=1)
+        out = self.fc(x_mean)
+        q_pred = F.normalize(out[:, 0:4], dim=1, eps=1e-8)
+        logvar = out[:, 4:7]
+        euler = quat_to_euler_xyz(q_pred)
+        return euler, logvar

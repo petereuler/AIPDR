@@ -11,7 +11,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from data.dataset_RIDI import load_ridi_raw, window_dataset as ridi_window, yaw_from_quat
-from models.pose_net import PoseNetTransformer, quat_to_rotmat
+from models.pose_net import PoseNetTransformer, quat_to_rotmat, quat_mul, quat_to_euler_xyz, euler_to_quat_xyz
 from utils.results import reconstruct_from_absolute_angles
 
 # ======= 基础工具函数 =======
@@ -30,6 +30,20 @@ def wrap_angle(x: np.ndarray) -> np.ndarray:
 def unwrap_rad(x):
     x = np.array(x, dtype=np.float32).reshape(-1)
     return np.unwrap(x)
+
+def integrate_gyro_rel(gyro_seq, dt):
+    bsz, tlen, _ = gyro_seq.shape
+    q = torch.zeros(bsz, 4, device=gyro_seq.device, dtype=gyro_seq.dtype)
+    q[:, 0] = 1.0
+    for t in range(tlen):
+        w = gyro_seq[:, t, :]
+        w_norm = torch.norm(w, dim=1, keepdim=True) + 1e-8
+        angle = w_norm * dt
+        axis = w / w_norm
+        half = 0.5 * angle
+        dq = torch.cat([torch.cos(half), axis * torch.sin(half)], dim=1)
+        q = quat_mul(q, dq)
+    return q / (q.norm(dim=1, keepdim=True) + 1e-8)
 
 def load_ridi_sequence(ridi_root: str, seq_name: str, window_size: int, stride: int):
     seq_dir = os.path.join(ridi_root, "data", seq_name)
@@ -190,23 +204,27 @@ def main():
     # 参数必须与训练一致
     WINDOW_SIZE = 64
     STRIDE = 64
-    pose_output_mode = "quat"
+    gyro_var_deg = 2.0
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
     # 1. 加载模型
     print("Loading PoseNet...")
-    pose_net = PoseNetTransformer(
-        imu_dim=6,
-        d_model=128,
-        output_mode=pose_output_mode,
-    ).to(device)
     if os.path.exists(ckpt_path):
-        pose_net.load_state_dict(torch.load(ckpt_path, map_location=device))
-        print("Checkpoint loaded.")
+        state = torch.load(ckpt_path, map_location=device)
+        pose_net = PoseNetTransformer(
+            imu_dim=6,
+            d_model=128,
+        ).to(device)
+        pose_net.load_state_dict(state)
+        print("Checkpoint loaded (quat+var).")
     else:
-        print("Error: Checkpoint not found! Using random weights.")
+        pose_net = PoseNetTransformer(
+            imu_dim=6,
+            d_model=128,
+        ).to(device)
+        print("Checkpoint loaded.")
     pose_net.eval()
 
     # 2. 获取测试列表
@@ -234,7 +252,18 @@ def main():
         
         # 推理
         with torch.no_grad():
-            R_pred_rel = pose_net(xb) # [B, 3, 3] Stride 旋转
+            euler_pred, logvar = pose_net.forward_euler(xb)
+            q_gyro = integrate_gyro_rel(
+                torch.tensor(x[:, :, 0:3], dtype=torch.float32, device=device),
+                dt=1.0 / 200.0,
+            )
+            euler_gyro = quat_to_euler_xyz(q_gyro)
+            Rv = torch.exp(logvar)
+            P0 = (torch.tensor(gyro_var_deg, device=xb.device) * torch.pi / 180.0) ** 2
+            K = P0 / (P0 + Rv + 1e-8)
+            fused = euler_gyro + K * (euler_pred - euler_gyro)
+            q_fused = euler_to_quat_xyz(fused[:, 0:1], fused[:, 1:2], fused[:, 2:3])
+            R_pred_rel = quat_to_rotmat(q_fused)
         
         # 准备数据: 相对旋转真值
         q_rel_gt = torch.tensor(y_rel, dtype=torch.float32, device=device)

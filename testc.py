@@ -3,17 +3,17 @@ import numpy as np
 import torch
 
 from data.dataset_RIDI import load_ridi_raw, window_dataset as ridi_window
-from models.pose_net import PoseNetTransformer, quat_conj, quat_to_rotmat, rotate_imu
+from models.pose_net import PoseNetTransformer, quat_conj, quat_mul, quat_to_rotmat, rotate_imu, quat_to_euler_xyz, euler_to_quat_xyz
 from models.navigator import Navigator
 from utils.navigator_pipeline import accumulate_rotations, compute_init_rot
 from utils.visualization import plot_trajectory_comparison, plot_time_series, plot_cumulative_series
 from matplotlib import pyplot as plt
 
-window_size = 320
+window_size = 64
 stride = 64
 batch_size = 256
 use_gt_pose = False
-pose_output_mode = "6d"
+gyro_var_deg = 2.0
 
 project_dir = "/home/admin407/code/zyshe/NavCorrector"
 ridi_root = os.path.join(project_dir, "RIDI")
@@ -45,15 +45,21 @@ def predict_navigator_batches(pose_net, navigator, gx, ax, seq_id, init_rot, use
             else:
                 sid = seq_id[start:end]
                 irot = init_rot[start:end]
-                R_delta = pose_net(xb)
+                euler_pred, logvar = pose_net.forward_euler(xb)
+                q_gyro = integrate_gyro_rel(torch.tensor(gx[start:end], dtype=torch.float32, device=device), dt=1.0 / 200.0)
+                euler_gyro = quat_to_euler_xyz(q_gyro)
+                Rv = torch.exp(logvar)
+                P0 = (torch.tensor(gyro_var_deg, device=xb.device) * torch.pi / 180.0) ** 2
+                K = P0 / (P0 + Rv + 1e-8)
+                fused = euler_gyro + K * (euler_pred - euler_gyro)
+                q_fused = euler_to_quat_xyz(fused[:, 0:1], fused[:, 1:2], fused[:, 2:3])
+                R_delta = quat_to_rotmat(q_fused)
                 R_abs = accumulate_rotations(R_delta, sid, irot)
             R_use = R_abs
             if R_align is not None:
                 R_use = torch.matmul(R_align[start:end], R_abs)
-            xb_global = rotate_imu(xb, R_use)
-            pred_dp = navigator(xb_global)
-            if R_align is not None:
-                pred_dp = torch.matmul(R_align[start:end].transpose(1, 2), pred_dp.unsqueeze(-1)).squeeze(-1)
+            pred_dp_body = navigator(xb)
+            pred_dp = torch.matmul(R_use, pred_dp_body.unsqueeze(-1)).squeeze(-1)
             preds_dp.append(pred_dp.cpu().numpy())
 
     pred_dp = np.concatenate(preds_dp, axis=0)
@@ -65,6 +71,22 @@ def build_traj_from_delta_p(init_pos, dp):
     traj[:, 0] = init_pos[0] + np.cumsum(dp[:, 0])
     traj[:, 1] = init_pos[1] + np.cumsum(dp[:, 1])
     return traj
+
+
+def integrate_gyro_rel(gyro_seq, dt):
+    bsz, tlen, _ = gyro_seq.shape
+    q = torch.zeros(bsz, 4, device=gyro_seq.device, dtype=gyro_seq.dtype)
+    q[:, 0] = 1.0
+    for t in range(tlen):
+        w = gyro_seq[:, t, :]
+        w_norm = torch.norm(w, dim=1, keepdim=True) + 1e-8
+        angle = w_norm * dt
+        axis = w / w_norm
+        half = 0.5 * angle
+        dq = torch.cat([torch.cos(half), axis * torch.sin(half)], dim=1)
+        q = quat_mul(q, dq)
+    return q / (q.norm(dim=1, keepdim=True) + 1e-8)
+
 
 
 def plot_absolute_heading(gt_head, pred_head, vis_num, output_path):
@@ -117,7 +139,6 @@ def main():
             nhead=4,
             num_layers=2,
             dim_feedforward=256,
-            output_mode=pose_output_mode,
         ).to(device)
         pose_net.load_state_dict(torch.load(pose_ckpt, map_location=device))
     navigator.load_state_dict(torch.load(nav_ckpt, map_location=device))
@@ -156,12 +177,8 @@ def main():
             init_rot = torch.tensor(init_rot_np, dtype=torch.float32, device=device)
             seq_id = torch.zeros(gx.shape[0], dtype=torch.int64, device=device)
 
-        q0 = torch.tensor(ori[0].astype(np.float32), device=device)
-        q_align = quat_conj(q0.unsqueeze(0))
-        R_align = quat_to_rotmat(q_align).repeat(gx.shape[0], 1, 1)
-
         pred_dp = predict_navigator_batches(
-            pose_net, navigator, gx, ax, seq_id, init_rot, use_gt_pose=use_gt_pose, yori=yori, R_align=R_align
+            pose_net, navigator, gx, ax, seq_id, init_rot, use_gt_pose=use_gt_pose, yori=yori, R_align=None
         )
 
         gt_traj = build_traj_from_delta_p(init_pos, ydp[:, :2])
