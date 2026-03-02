@@ -10,8 +10,8 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from data.dataset_RIDI import load_ridi_raw, window_dataset as ridi_window, yaw_from_quat
-from models.pose_net import PoseNetTransformer, quat_to_rotmat, quat_mul, quat_to_euler_xyz, euler_to_quat_xyz
+from data.dataset_RIDI import load_ridi_raw, window_dataset as ridi_window
+from models.pose_net import PoseNetTransformer, quat_to_rotmat
 from utils.results import reconstruct_from_absolute_angles
 
 # ======= 基础工具函数 =======
@@ -27,23 +27,19 @@ def rotmat_to_euler_xyz(R: torch.Tensor) -> torch.Tensor:
 def wrap_angle(x: np.ndarray) -> np.ndarray:
     return (x + np.pi) % (2 * np.pi) - np.pi
 
+def yaw_from_quat(q):
+    q = np.array(q, dtype=np.float32)
+    if q.ndim == 1:
+        q = q.reshape(1, 4)
+    w = q[:, 0]
+    x = q[:, 1]
+    y = q[:, 2]
+    z = q[:, 3]
+    return np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
 def unwrap_rad(x):
     x = np.array(x, dtype=np.float32).reshape(-1)
     return np.unwrap(x)
-
-def integrate_gyro_rel(gyro_seq, dt):
-    bsz, tlen, _ = gyro_seq.shape
-    q = torch.zeros(bsz, 4, device=gyro_seq.device, dtype=gyro_seq.dtype)
-    q[:, 0] = 1.0
-    for t in range(tlen):
-        w = gyro_seq[:, t, :]
-        w_norm = torch.norm(w, dim=1, keepdim=True) + 1e-8
-        angle = w_norm * dt
-        axis = w / w_norm
-        half = 0.5 * angle
-        dq = torch.cat([torch.cos(half), axis * torch.sin(half)], dim=1)
-        q = quat_mul(q, dq)
-    return q / (q.norm(dim=1, keepdim=True) + 1e-8)
 
 def load_ridi_sequence(ridi_root: str, seq_name: str, window_size: int, stride: int):
     seq_dir = os.path.join(ridi_root, "data", seq_name)
@@ -51,16 +47,18 @@ def load_ridi_sequence(ridi_root: str, seq_name: str, window_size: int, stride: 
         return None
     
     # 1. 加载原始数据
-    gyro, acc, pos3d, ori = load_ridi_raw(seq_dir)
+    gyro, acc, pos_xyz, ori = load_ridi_raw(seq_dir)
     
     # 2. 切分窗口
     try:
-        # y_rel 就是 stride 期间的相对旋转
-        [gx, ax], [dl, _, abs_h, y_rel], init_pos, _ = ridi_window(
-            gyro, acc, pos3d, ori,
-            mode="2d", window_size=window_size, stride=stride,
-            filter_window=20, smooth_heading=True, heading_sigma=1.5,
-            return_abs_heading=True, return_rel_ori=True, align_heading_to_init_pose=False
+        # y_rel 是 stride 期间的相对旋转；ydp_world 用于重建运动航向
+        [gx, ax], [dl, y_rel, ydp_world], init_pos, _ = ridi_window(
+            gyro, acc, pos_xyz, ori,
+            window_size=window_size, stride=stride,
+            filter_window=20,
+            smooth_length=False, length_sigma=1.0,
+            return_rel_ori=True,
+            return_delta_p_world=True,
         )
     except Exception as e:
         print(f"Error processing {seq_name}: {e}")
@@ -83,11 +81,11 @@ def load_ridi_sequence(ridi_root: str, seq_name: str, window_size: int, stride: 
 
     x = x[:min_len]
     y_rel = y_rel[:min_len]
-    abs_h = abs_h[:min_len]
+    heading_motion = np.arctan2(ydp_world[:min_len, 1], ydp_world[:min_len, 0]).reshape(-1, 1)
     dl = dl[:min_len]
     ori_seq = ori[b_indices[:min_len]]
 
-    return x, y_rel, abs_h, dl, init_pos, ori_seq
+    return x, y_rel, heading_motion, dl, init_pos, ori_seq
 
 # ======= 三大绘图函数 =======
 
@@ -204,7 +202,6 @@ def main():
     # 参数必须与训练一致
     WINDOW_SIZE = 64
     STRIDE = 64
-    gyro_var_deg = 2.0
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -247,23 +244,13 @@ def main():
         if data is None:
             continue
             
-        x, y_rel, abs_h_gt, dl, init_pos, ori_gt_seq = data
+        x, y_rel, heading_motion_gt, dl, init_pos, ori_gt_seq = data
         xb = torch.tensor(x, dtype=torch.float32, device=device)
         
         # 推理
         with torch.no_grad():
-            euler_pred, logvar = pose_net.forward_euler(xb)
-            q_gyro = integrate_gyro_rel(
-                torch.tensor(x[:, :, 0:3], dtype=torch.float32, device=device),
-                dt=1.0 / 200.0,
-            )
-            euler_gyro = quat_to_euler_xyz(q_gyro)
-            Rv = torch.exp(logvar)
-            P0 = (torch.tensor(gyro_var_deg, device=xb.device) * torch.pi / 180.0) ** 2
-            K = P0 / (P0 + Rv + 1e-8)
-            fused = euler_gyro + K * (euler_pred - euler_gyro)
-            q_fused = euler_to_quat_xyz(fused[:, 0:1], fused[:, 1:2], fused[:, 2:3])
-            R_pred_rel = quat_to_rotmat(q_fused)
+            q_rel_pred = pose_net(xb)
+            R_pred_rel = quat_to_rotmat(q_rel_pred)
         
         # 准备数据: 相对旋转真值
         q_rel_gt = torch.tensor(y_rel, dtype=torch.float32, device=device)
@@ -295,7 +282,7 @@ def main():
         
         yaw_phone_pred_raw = rotmat_to_euler_xyz(R_abs_tensor)[:, 2].cpu().numpy()
         yaw_phone_gt_raw = yaw_from_quat(ori_gt_seq).flatten()
-        heading_motion_gt_raw = abs_h_gt.flatten()
+        heading_motion_gt_raw = heading_motion_gt.flatten()
 
         # 不对齐航向角，使用绝对姿态与原始运动航向
         yaw_pred_for_traj = wrap_angle(yaw_phone_pred_raw)

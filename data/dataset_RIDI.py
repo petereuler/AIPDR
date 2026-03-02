@@ -3,22 +3,6 @@ import numpy as np
 from scipy.ndimage import gaussian_filter1d
 
 
-def wrap_angle(angle):
-    """将角度归一化到 [-pi, pi] 范围，支持标量或数组。"""
-    return (angle + np.pi) % (2 * np.pi) - np.pi
-
-
-def yaw_from_quat(q):
-    q = np.array(q, dtype=np.float32)
-    if q.ndim == 1:
-        q = q.reshape(1, 4)
-    w = q[:, 0]
-    x = q[:, 1]
-    y = q[:, 2]
-    z = q[:, 3]
-    return np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
-
-
 def quat_conj(q):
     q = np.array(q, dtype=np.float32)
     return np.array([q[0], -q[1], -q[2], -q[3]], dtype=np.float32)
@@ -27,30 +11,47 @@ def quat_conj(q):
 def quat_mul(q1, q2):
     w1, x1, y1, z1 = q1
     w2, x2, y2, z2 = q2
-    w = w1*w2 - x1*x2 - y1*y2 - z1*z2
-    x = w1*x2 + x1*w2 + y1*z2 - z1*y2
-    y = w1*y2 - x1*z2 + y1*w2 + z1*x2
-    z = w1*z2 + x1*y2 - y1*x2 + z1*w2
+    w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+    x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+    y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+    z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
     return np.array([w, x, y, z], dtype=np.float32)
+
+def quat_to_rotmat(q):
+    w, x, y, z = q
+    ww = w * w
+    xx = x * x
+    yy = y * y
+    zz = z * z
+    wx = w * x
+    wy = w * y
+    wz = w * z
+    xy = x * y
+    xz = x * z
+    yz = y * z
+    return np.array([
+        [ww + xx - yy - zz, 2 * (xy - wz), 2 * (xz + wy)],
+        [2 * (xy + wz), ww - xx + yy - zz, 2 * (yz - wx)],
+        [2 * (xz - wy), 2 * (yz + wx), ww - xx - yy + zz],
+    ], dtype=np.float32)
+
 
 def moving_average(x, k):
     """简易滑动平均滤波，窗口 k>=1；k<=1 时原样返回。"""
     if k is None or k <= 1:
         return x
     k = int(k)
-    if k <= 1:
-        return x
     kernel = np.ones(k, dtype=float) / float(k)
     if isinstance(x, np.ndarray) and x.ndim == 1:
-        return np.convolve(x, kernel, mode='same')
+        return np.convolve(x, kernel, mode="same")
     if isinstance(x, np.ndarray) and x.ndim == 2:
-        return np.stack([np.convolve(x[:, i], kernel, mode='same') for i in range(x.shape[1])], axis=1)
+        return np.stack([np.convolve(x[:, i], kernel, mode="same") for i in range(x.shape[1])], axis=1)
     return x
 
 
 def _load_txt(path):
-    with open(path, 'r') as f:
-        lines = [l for l in f if l.strip() and not l.startswith('#')]
+    with open(path, "r") as f:
+        lines = [l for l in f if l.strip() and not l.startswith("#")]
     return np.loadtxt(lines)
 
 
@@ -109,7 +110,6 @@ def load_ridi_raw(seq_dir, acc_source="acce"):
     pos = _interp_to(t_pose, pose_arr[:, 1:4], t_gyro)
 
     if pose_arr is not None and pose_arr.shape[1] >= 8:
-        t_pose = pose_arr[:, 0]
         pose_quat = pose_arr[:, -4:]
         if POSE_ORDER == "xyzw":
             pose_quat = pose_quat[:, [3, 0, 1, 2]]
@@ -131,158 +131,99 @@ def load_ridi_raw(seq_dir, acc_source="acce"):
     return gyro.astype(np.float32), acc.astype(np.float32), pos.astype(np.float32), ori.astype(np.float32)
 
 
-def window_dataset(gyro_data, acc_data, pos_data, ori_data, mode="2d",
+def window_dataset(gyro_data, acc_data, pos_data, ori_data,
                    window_size=160, stride=36, filter_window=20,
-                   smooth_heading=True, heading_sigma=1.5,
                    smooth_length=False, length_sigma=1.0,
-                   return_abs_heading=False, return_ori=False, return_rel_ori=False,
-                   return_delta_p=False,
-                   abs_heading_from_ori=False, align_heading_to_init_pose=False):
-    mid = window_size // 2 - stride // 2
+                   return_ori=False, return_rel_ori=False,
+                   return_delta_p=False, return_delta_p_world=False):
     m = min(gyro_data.shape[0], acc_data.shape[0], pos_data.shape[0], ori_data.shape[0])
     gyro_data = gyro_data[:m]
     acc_data = acc_data[:m]
     pos_data = pos_data[:m]
     ori_data = ori_data[:m]
 
-    if mode == "2d":
-        pos2d = pos_data[:, :2]
-        if filter_window and filter_window > 1:
-            pos2d = moving_average(pos2d, filter_window)
+    # Always compute XYZ deltas for 3D labels.
+    pos_xyz = pos_data
+    if filter_window and filter_window > 1:
+        pos_xyz = moving_average(pos_xyz, filter_window)
 
-        x_gyro = []
-        x_acc = []
-        y_len = []
-        y_head = []
-        y_abs = []
-        y_ori = []
-        y_rel = []
-        y_dp = []
+    imu_gyro = []
+    imu_acc = []
+    y_len = []
+    y_ori = []
+    y_rel = []
+    y_dp = []
+    y_dp_world = []
 
-        idx_0 = 0
-        a_0 = idx_0 + window_size // 2 - stride // 2
-        b_0 = idx_0 + window_size // 2 + stride // 2
-        a_0 = max(0, min(a_0, len(pos2d)-1))
-        b_0 = max(0, min(b_0, len(pos2d)-1))
+    # Each window uses two midpoints:
+    # start_idx = center - stride/2, end_idx = center + stride/2
+    start_0 = window_size // 2 - stride // 2
+    end_0 = window_size // 2 + stride // 2
+    start_0 = max(0, min(start_0, len(pos_xyz) - 1))
+    end_0 = max(0, min(end_0, len(pos_xyz) - 1))
 
-        init_pos = pos2d[a_0, :]
-        if abs_heading_from_ori:
-            yaw0 = float(yaw_from_quat(ori_data[b_0])[0])
-            init_head = 0.0
-        else:
-            diff_0 = pos2d[b_0] - pos2d[a_0]
-            init_head = float(np.arctan2(diff_0[1], diff_0[0]))
-            if align_heading_to_init_pose:
-                yaw0 = float(yaw_from_quat(ori_data[b_0])[0])
-                init_head = 0.0
+    init_pos = pos_xyz[start_0, :2]
+    init_head = 0.0
 
-        max_start = gyro_data.shape[0] - window_size - 1
-        prev_chord_angle = 0.0
-        for i, idx in enumerate(range(0, max_start, stride)):
-            xg = gyro_data[idx + 1: idx + 1 + window_size, :]
-            xa = acc_data[idx + 1: idx + 1 + window_size, :]
-            x_gyro.append(xg)
-            x_acc.append(xa)
+    max_start = gyro_data.shape[0] - window_size - 1
+    for idx in range(0, max_start, stride):
+        gyro_window = gyro_data[idx + 1: idx + 1 + window_size, :]
+        acc_window = acc_data[idx + 1: idx + 1 + window_size, :]
+        imu_gyro.append(gyro_window)
+        imu_acc.append(acc_window)
 
-            a = idx + window_size // 2 - stride // 2
-            b = idx + window_size // 2 + stride // 2
-            a = max(0, min(a, len(pos2d)-1))
-            b = max(0, min(b, len(pos2d)-1))
+        start_idx = idx + window_size // 2 - stride // 2
+        end_idx = idx + window_size // 2 + stride // 2
+        start_idx = max(0, min(start_idx, len(pos_xyz) - 1))
+        end_idx = max(0, min(end_idx, len(pos_xyz) - 1))
 
-            pa = pos2d[a, :]
-            pb = pos2d[b, :]
+        pos_start_xyz = pos_xyz[start_idx, :]
+        pos_end_xyz = pos_xyz[end_idx, :]
 
-            delta_len = np.linalg.norm(pb - pa)
-            curr_diff = pb - pa
-            if np.linalg.norm(curr_diff) < 1e-6:
-                curr_chord_angle = 0.0 if i == 0 else prev_chord_angle
-            else:
-                curr_chord_angle = np.arctan2(curr_diff[1], curr_diff[0])
+        delta_len = np.linalg.norm(pos_end_xyz - pos_start_xyz)
 
-            if i == 0:
-                delta_head = 0.0
-                prev_chord_angle = curr_chord_angle
-            else:
-                prev_a = a - stride
-                if prev_a < 0:
-                    delta_head = 0.0
-                    prev_chord_angle = curr_chord_angle
-                else:
-                    prev_p = pos2d[prev_a]
-                    prev_diff = pa - prev_p
-                    prev_chord_angle = np.arctan2(prev_diff[1], prev_diff[0])
-                    delta_head = wrap_angle(curr_chord_angle - prev_chord_angle)
-
-            y_len.append(np.array([delta_len], dtype=np.float32))
-            y_head.append(np.array([delta_head], dtype=np.float32))
-            if return_delta_p:
-                pa3 = pos_data[a, :]
-                pb3 = pos_data[b, :]
-                y_dp.append((pb3 - pa3).astype(np.float32))
-            if return_abs_heading:
-                if abs_heading_from_ori:
-                    curr_abs = float(wrap_angle(yaw_from_quat(ori_data[b])[0] - yaw0))
-                else:
-                    curr_abs = curr_chord_angle
-                    if align_heading_to_init_pose:
-                        curr_abs = float(wrap_angle(curr_abs - yaw0))
-                y_abs.append(np.array([curr_abs], dtype=np.float32))
-            if return_ori:
-                y_ori.append(ori_data[b].astype(np.float32))
-            if return_rel_ori:
-                qa = ori_data[a].astype(np.float32)
-                qb = ori_data[b].astype(np.float32)
-                q_rel = quat_mul(quat_conj(qa), qb)
-                y_rel.append(q_rel)
-
-        x_gyro = np.array(x_gyro)
-        x_acc = np.array(x_acc)
-        y_len = np.array(y_len)
-        y_head = np.array(y_head)
-        if return_abs_heading:
-            y_abs = np.array(y_abs)
-        if return_ori:
-            y_ori = np.array(y_ori)
-        if return_rel_ori:
-            y_rel = np.array(y_rel)
+        y_len.append(np.array([delta_len], dtype=np.float32))
         if return_delta_p:
-            y_dp = np.array(y_dp)
-
-
-        if smooth_length and len(y_len) > 0:
-            y_len_smooth = gaussian_filter1d(y_len.flatten(), sigma=length_sigma)
-            y_len = y_len_smooth.reshape(-1, 1)
-
-        if smooth_heading and len(y_head) > 0:
-            y_head_smooth = gaussian_filter1d(y_head.flatten(), sigma=heading_sigma)
-            y_head = y_head_smooth.reshape(-1, 1)
-            if return_abs_heading and len(y_abs) > 0:
-                sin_h = np.sin(y_abs.flatten())
-                cos_h = np.cos(y_abs.flatten())
-                sin_s = gaussian_filter1d(sin_h, sigma=heading_sigma)
-                cos_s = gaussian_filter1d(cos_h, sigma=heading_sigma)
-                y_abs = np.arctan2(sin_s, cos_s).reshape(-1, 1)
-
-        if return_abs_heading and return_ori and return_rel_ori and return_delta_p:
-            return [x_gyro, x_acc], [y_len, y_head, y_abs, y_ori, y_rel, y_dp], init_pos, init_head
-        if return_abs_heading and return_rel_ori and return_delta_p:
-            return [x_gyro, x_acc], [y_len, y_head, y_abs, y_rel, y_dp], init_pos, init_head
-        if return_abs_heading and return_delta_p:
-            return [x_gyro, x_acc], [y_len, y_head, y_abs, y_dp], init_pos, init_head
-        if return_rel_ori and return_delta_p:
-            return [x_gyro, x_acc], [y_len, y_head, y_rel, y_dp], init_pos, init_head
-        if return_delta_p:
-            return [x_gyro, x_acc], [y_len, y_head, y_dp], init_pos, init_head
-        if return_abs_heading and return_ori and return_rel_ori:
-            return [x_gyro, x_acc], [y_len, y_head, y_abs, y_ori, y_rel], init_pos, init_head
-        if return_abs_heading and return_rel_ori:
-            return [x_gyro, x_acc], [y_len, y_head, y_abs, y_rel], init_pos, init_head
-        if return_abs_heading:
-            return [x_gyro, x_acc], [y_len, y_head, y_abs], init_pos, init_head
+            dp_world = (pos_end_xyz - pos_start_xyz).astype(np.float32)
+            q_start = ori_data[start_idx].astype(np.float32)
+            R_start = quat_to_rotmat(q_start)
+            dp_body = (R_start.T @ dp_world.reshape(3, 1)).reshape(3,)
+            y_dp.append(dp_body.astype(np.float32))
+        if return_delta_p_world:
+            if not return_delta_p:
+                dp_world = (pos_end_xyz - pos_start_xyz).astype(np.float32)
+            y_dp_world.append(dp_world.astype(np.float32))
         if return_ori:
-            return [x_gyro, x_acc], [y_len, y_head, y_ori], init_pos, init_head
+            y_ori.append(ori_data[end_idx].astype(np.float32))
         if return_rel_ori:
-            return [x_gyro, x_acc], [y_len, y_head, y_rel], init_pos, init_head
-        return [x_gyro, x_acc], [y_len, y_head], init_pos, init_head
+            q_start = ori_data[start_idx].astype(np.float32)
+            q_end = ori_data[end_idx].astype(np.float32)
+            q_rel = quat_mul(quat_conj(q_start), q_end)
+            y_rel.append(q_rel)
 
-    raise ValueError("mode must be '2d' or '3d'")
+    x_gyro = np.array(imu_gyro)
+    x_acc = np.array(imu_acc)
+    y_len = np.array(y_len)
+    if return_ori:
+        y_ori = np.array(y_ori)
+    if return_rel_ori:
+        y_rel = np.array(y_rel)
+    if return_delta_p:
+        y_dp = np.array(y_dp)
+    if return_delta_p_world:
+        y_dp_world = np.array(y_dp_world)
+
+    if smooth_length and len(y_len) > 0:
+        y_len_smooth = gaussian_filter1d(y_len.flatten(), sigma=length_sigma)
+        y_len = y_len_smooth.reshape(-1, 1)
+
+    labels = [y_len]
+    if return_ori:
+        labels.append(y_ori)
+    if return_rel_ori:
+        labels.append(y_rel)
+    if return_delta_p:
+        labels.append(y_dp)
+    if return_delta_p_world:
+        labels.append(y_dp_world)
+    return [x_gyro, x_acc], labels, init_pos, init_head

@@ -91,104 +91,85 @@ def load_ronin_raw(seq_path):
     return gyro, acc, pos3, yaw.reshape(-1, 1)
 
 
-def window_dataset(gyro_data, acc_data, pos_data, ori_data, mode="2d", window_size=200, stride=10, filter_window=10, smooth_heading=True, heading_sigma=1, smooth_length=False, length_sigma=1.0, return_rel_ori=False, return_delta_p=False):
-    mid = window_size // 2 - stride // 2
+def window_dataset(gyro_data, acc_data, pos_data, ori_data, window_size=200, stride=10, filter_window=10, smooth_heading=True, heading_sigma=1, smooth_length=False, length_sigma=1.0, return_rel_ori=False, return_delta_p=False):
     m = min(gyro_data.shape[0], acc_data.shape[0], pos_data.shape[0], ori_data.shape[0])
     gyro_data = gyro_data[:m]
     acc_data = acc_data[:m]
     pos_data = pos_data[:m]
     ori_data = ori_data[:m]
-    if mode == "2d":
-        pos2d = pos_data[:, :2]
-        if filter_window and filter_window > 1:
-            pos2d = moving_average(pos2d, filter_window)
-        
-        x_gyro = []
-        x_acc = []
-        y_len = []
-        y_head = []
-        y_rel = []
-        y_dp = []
-        
-        # init_pos & init_head
-        idx_0 = 0
-        a_0 = idx_0 + window_size // 2 - stride // 2
-        b_0 = idx_0 + window_size // 2 + stride // 2
-        a_0 = max(0, min(a_0, len(pos2d)-1))
-        b_0 = max(0, min(b_0, len(pos2d)-1))
-        init_pos = pos2d[a_0, :]
-        
-        diff_0 = pos2d[b_0] - pos2d[a_0]
-        init_head = float(np.arctan2(diff_0[1], diff_0[0]))
 
-        max_start = gyro_data.shape[0] - window_size - 1
-        for i, idx in enumerate(range(0, max_start, stride)):
-            xg = gyro_data[idx + 1: idx + 1 + window_size, :]
-            xa = acc_data[idx + 1: idx + 1 + window_size, :]
-            x_gyro.append(xg)
-            x_acc.append(xa)
-            
-            a = idx + window_size // 2 - stride // 2
-            b = idx + window_size // 2 + stride // 2
-            a = max(0, min(a, len(pos2d)-1))
-            b = max(0, min(b, len(pos2d)-1))
-            
-            pa = pos2d[a, :]
-            pb = pos2d[b, :]
-            
-            delta_len = np.linalg.norm(pb - pa)
-            
-            curr_diff = pb - pa
-            if np.linalg.norm(curr_diff) < 1e-6:
-                curr_chord_angle = 0.0 if i == 0 else prev_chord_angle
-            else:
-                curr_chord_angle = np.arctan2(curr_diff[1], curr_diff[0])
-            
-            if i == 0:
+    pos_xyz = pos_data
+    if filter_window and filter_window > 1:
+        pos_xyz = moving_average(pos_xyz, filter_window)
+    pos_xy = pos_xyz[:, :2]
+
+    x_gyro = []
+    x_acc = []
+    y_len = []
+    y_head = []
+
+    start_0 = window_size // 2 - stride // 2
+    end_0 = window_size // 2 + stride // 2
+    start_0 = max(0, min(start_0, len(pos_xy) - 1))
+    end_0 = max(0, min(end_0, len(pos_xy) - 1))
+    init_pos = pos_xy[start_0, :]
+
+    diff_0 = pos_xy[end_0] - pos_xy[start_0]
+    init_head = float(np.arctan2(diff_0[1], diff_0[0]))
+
+    max_start = gyro_data.shape[0] - window_size - 1
+    prev_chord_angle = 0.0
+    for i, idx in enumerate(range(0, max_start, stride)):
+        xg = gyro_data[idx + 1: idx + 1 + window_size, :]
+        xa = acc_data[idx + 1: idx + 1 + window_size, :]
+        x_gyro.append(xg)
+        x_acc.append(xa)
+
+        start_idx = idx + window_size // 2 - stride // 2
+        end_idx = idx + window_size // 2 + stride // 2
+        start_idx = max(0, min(start_idx, len(pos_xy) - 1))
+        end_idx = max(0, min(end_idx, len(pos_xy) - 1))
+
+        pos_start_xy = pos_xy[start_idx, :]
+        pos_end_xy = pos_xy[end_idx, :]
+        pos_start_xyz = pos_xyz[start_idx, :]
+        pos_end_xyz = pos_xyz[end_idx, :]
+
+        delta_len = np.linalg.norm(pos_end_xyz - pos_start_xyz)
+        curr_diff = pos_end_xy - pos_start_xy
+        if np.linalg.norm(curr_diff) < 1e-6:
+            curr_chord_angle = 0.0 if i == 0 else prev_chord_angle
+        else:
+            curr_chord_angle = np.arctan2(curr_diff[1], curr_diff[0])
+
+        if i == 0:
+            delta_head = 0.0
+            prev_chord_angle = curr_chord_angle
+        else:
+            prev_start = start_idx - stride
+            if prev_start < 0:
                 delta_head = 0.0
+                prev_chord_angle = curr_chord_angle
             else:
-                prev_a = a - stride
-                if prev_a < 0:
-                    delta_head = 0.0
-                else:
-                    prev_p = pos2d[prev_a]
-                    prev_diff = pa - prev_p
-                    if np.linalg.norm(prev_diff) < 1e-6:
-                        prev_chord_angle = curr_chord_angle
-                    else:
-                        prev_chord_angle = np.arctan2(prev_diff[1], prev_diff[0])
-                    delta_head = wrap_angle(curr_chord_angle - prev_chord_angle)
-            
-            y_len.append(np.array([delta_len], dtype=np.float32))
-            y_head.append(np.array([delta_head], dtype=np.float32))
+                prev_p = pos_xy[prev_start]
+                prev_diff = pos_start_xy - prev_p
+                prev_chord_angle = np.arctan2(prev_diff[1], prev_diff[0])
+                delta_head = wrap_angle(curr_chord_angle - prev_chord_angle)
 
-        x_gyro = np.array(x_gyro)
-        x_acc = np.array(x_acc)
-        y_len = np.array(y_len)
-        y_head = np.array(y_head)
+        y_len.append(np.array([delta_len], dtype=np.float32))
+        y_head.append(np.array([delta_head], dtype=np.float32))
 
-        # # 在平滑之前进行数据清洗：基于步长判断静止状态
-        # # 如果步长绝对值小于阈值，说明处于静止状态，将步长和航向角都设为0
-        # if len(y_len) > 0 and len(y_head) > 0:
-        #     # 基于步长判断是否静止
-        #     stationary_mask = np.abs(y_len.flatten()) < 0.01  # 步长小于1cm认为静止
+    x_gyro = np.array(x_gyro)
+    x_acc = np.array(x_acc)
+    y_len = np.array(y_len)
+    y_head = np.array(y_head)
 
-        #     # 将静止状态的样本标签设为0
-        #     y_len[stationary_mask, 0] = 0.0
-        #     y_head[stationary_mask, 0] = 0.0
+    if smooth_length and len(y_len) > 0:
+        y_len_smooth = gaussian_filter1d(y_len.flatten(), sigma=length_sigma)
+        y_len = y_len_smooth.reshape(-1, 1)
 
-        # 对步长进行平滑处理（提高真值轨迹的光滑性）
-        if smooth_length and len(y_len) > 0:
-            y_len_smooth = gaussian_filter1d(y_len.flatten(), sigma=length_sigma)
-            y_len = y_len_smooth.reshape(-1, 1)
-        
-        # 对航向角进行平滑处理（提高真值轨迹的光滑性）
-        if smooth_heading and len(y_head) > 0:
-            y_head_smooth = gaussian_filter1d(y_head.flatten(), sigma=heading_sigma)
-            y_head = y_head_smooth.reshape(-1, 1)
-        
-        return [x_gyro, x_acc], [y_len, y_head], init_pos, init_head
-    elif mode == "3d":
-        raise ValueError("RONIN helper only provides 2d windows here")
-    else:
-        raise ValueError("mode must be '2d' or '3d'")
+    if smooth_heading and len(y_head) > 0:
+        y_head_smooth = gaussian_filter1d(y_head.flatten(), sigma=heading_sigma)
+        y_head = y_head_smooth.reshape(-1, 1)
+
+    return [x_gyro, x_acc], [y_len, y_head], init_pos, init_head

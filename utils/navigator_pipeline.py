@@ -23,9 +23,9 @@ def accumulate_rotations(R_delta: torch.Tensor, seq_id: torch.Tensor, init_rot: 
     return torch.stack(R_abs, dim=0)
 
 
-def compute_init_rot(ori: np.ndarray, pos3d: np.ndarray, window_size: int, stride: int) -> np.ndarray:
+def compute_init_rot(ori: np.ndarray, pos_xyz: np.ndarray, window_size: int, stride: int) -> np.ndarray:
     """Compute init rotation using pure GT orientation (no heading alignment)."""
-    max_start = pos3d.shape[0] - window_size - 1
+    max_start = pos_xyz.shape[0] - window_size - 1
     if max_start <= 0:
         return np.zeros((0, 3, 3), dtype=np.float32)
 

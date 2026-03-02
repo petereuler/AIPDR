@@ -163,8 +163,7 @@ class PoseNet(nn.Module):
         _, h = self.gru(imu_seq)
         h = h[-1]
         q_pred = F.normalize(self.fc(h), dim=1, eps=1e-8)
-        R_pred = quat_to_rotmat(q_pred)
-        return R_pred
+        return q_pred
 
 
 class PositionalEncoding(nn.Module):
@@ -183,8 +182,7 @@ class PositionalEncoding(nn.Module):
 
 class PoseNetTransformer(nn.Module):
     """
-    Transformer-based pose estimator. Input: [B, T, 6], Output: [B, 3, 3].
-    输出四元数 + 对应欧拉角的对数方差（用于融合）。
+    Transformer-based pose estimator. Input: [B, T, 6], Output: [B, 4] quaternion.
     """
     def __init__(self, imu_dim=6, d_model=128, nhead=4, num_layers=2, dim_feedforward=256, dropout=0.1):
         super().__init__()
@@ -198,8 +196,7 @@ class PoseNetTransformer(nn.Module):
             batch_first=True,
         )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        # 4 for quaternion + 3 for euler log-variance
-        self.fc = nn.Linear(d_model, 7)
+        self.fc = nn.Linear(d_model, 4)
 
     def forward(self, imu_seq):
         x = self.input_proj(imu_seq)
@@ -208,19 +205,4 @@ class PoseNetTransformer(nn.Module):
         x_mean = x.mean(dim=1)
         out = self.fc(x_mean)
         q_pred = F.normalize(out[:, 0:4], dim=1, eps=1e-8)
-        R_pred = quat_to_rotmat(q_pred)
-        return R_pred
-
-    def forward_euler(self, imu_seq):
-        """
-        返回: euler_pred, logvar (用于融合)
-        """
-        x = self.input_proj(imu_seq)
-        x = self.pos_encoder(x)
-        x = self.transformer_encoder(x)
-        x_mean = x.mean(dim=1)
-        out = self.fc(x_mean)
-        q_pred = F.normalize(out[:, 0:4], dim=1, eps=1e-8)
-        logvar = out[:, 4:7]
-        euler = quat_to_euler_xyz(q_pred)
-        return euler, logvar
+        return q_pred

@@ -5,9 +5,9 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
-from models.pose_net import PoseNetTransformer, rotmat_to_quat, quat_conj, quat_mul, quat_to_rotmat, quat_to_euler_xyz, euler_to_quat_xyz
+from models.pose_net import PoseNetTransformer, quat_conj, quat_mul, quat_to_rotmat
 from models.navigator import Navigator
-from utils.training_utils import load_data_2d_ridi_absheading
+from utils.training_utils import load_data_ridi_absheading
 
 # ======= 参数设置 =======
 window_size = 64   # 约 1.6s ~ 3.2s
@@ -19,10 +19,9 @@ feat_dim = 64
 lr = 1e-4
 weight_decay = 1e-4
 epochs = 200
-pose_epochs = 50
+pose_epochs = 200
 nav_epochs = 200
-joint_epochs = 50
-gyro_var_deg = 2.0
+joint_epochs = 200
 
 # 路径设置
 project_dir = "/home/admin407/code/zyshe/NavCorrector"
@@ -55,7 +54,7 @@ def rotate_imu_by_matrix(imu_seq, R_mat):
     imu_flat = imu_seq.reshape(-1, dim)
     
     if dim == 3:
-        # 只旋转 3D 向量
+        # 只旋转三维向量
         imu_rot = torch.matmul(R_seq_flat, imu_flat.unsqueeze(-1)).squeeze(-1)
     elif dim == 6:
         # 分别旋转 Gyro (0:3) 和 Acc (3:6)
@@ -68,34 +67,6 @@ def rotate_imu_by_matrix(imu_seq, R_mat):
         raise ValueError("Unsupported IMU dim")
         
     return imu_rot.view(batch_size, seq_len, dim)
-
-def integrate_gyro_rel(gyro_seq, dt):
-    bsz, tlen, _ = gyro_seq.shape
-    q = torch.zeros(bsz, 4, device=gyro_seq.device, dtype=gyro_seq.dtype)
-    q[:, 0] = 1.0
-    for t in range(tlen):
-        w = gyro_seq[:, t, :]
-        w_norm = torch.norm(w, dim=1, keepdim=True) + 1e-8
-        angle = w_norm * dt
-        axis = w / w_norm
-        half = 0.5 * angle
-        dq = torch.cat([torch.cos(half), axis * torch.sin(half)], dim=1)
-        q = quat_mul(q, dq)
-    return q / (q.norm(dim=1, keepdim=True) + 1e-8)
-
-def fuse_gyro_pose_euler(xb, pose_net, dt):
-    euler_pred, logvar = pose_net.forward_euler(xb)
-    q_gyro = integrate_gyro_rel(xb[:, :, 0:3], dt)
-    euler_gyro = quat_to_euler_xyz(q_gyro)
-    R = torch.exp(logvar)
-    P0 = (torch.tensor(gyro_var_deg, device=xb.device) * torch.pi / 180.0) ** 2
-    K = P0 / (P0 + R + 1e-8)
-    return euler_gyro + K * (euler_pred - euler_gyro)
-
-def fused_rotmat_from_gyro(xb, pose_net, dt):
-    fused = fuse_gyro_pose_euler(xb, pose_net, dt)
-    q_fused = euler_to_quat_xyz(fused[:, 0:1], fused[:, 1:2], fused[:, 2:3])
-    return quat_to_rotmat(q_fused)
 
 
 # ======= 训练函数 =======
@@ -121,8 +92,7 @@ def train_pose_net(pose_net, train_loader):
         cnt = 0
         for batch in train_loader:
             xb, yb_rel = batch[0], batch[1]
-            fused = fuse_gyro_pose_euler(xb, pose_net, dt=1.0 / 200.0)
-            q_fused = euler_to_quat_xyz(fused[:, 0:1], fused[:, 1:2], fused[:, 2:3])
+            q_fused = pose_net(xb)
             q_gt = yb_rel / (yb_rel.norm(dim=1, keepdim=True) + 1e-8)
             dot = torch.abs(torch.sum(q_fused * q_gt, dim=1))
             loss = torch.mean(1.0 - dot)
@@ -141,8 +111,7 @@ def train_pose_net(pose_net, train_loader):
         cnt = 0
         for batch in train_loader:
             xb, yb_rel = batch[0], batch[1]
-            fused = fuse_gyro_pose_euler(xb, pose_net, dt=1.0 / 200.0)
-            q_fused = euler_to_quat_xyz(fused[:, 0:1], fused[:, 1:2], fused[:, 2:3])
+            q_fused = pose_net(xb)
             q_gt = yb_rel / (yb_rel.norm(dim=1, keepdim=True) + 1e-8)
             dot = torch.abs(torch.sum(q_fused * q_gt, dim=1))
             loss = torch.mean(1.0 - dot)
@@ -213,7 +182,7 @@ def train_navigator_corrected(
             # yb_dp: GT Displacement (Global Frame)
             # yb_ori: GT Orientation at window end (For Gravity Removal / Anchor)
             # yb_rel: GT Relative Orientation (qa^-1 * qb)
-            xb, yb_dp, yb_ori, yb_rel, yb_align = batch
+            xb, yb_dp, yb_dpw, yb_ori, yb_rel, yb_align = batch
             
             acc_raw = xb[:, :, 3:6]
             gyro_raw = xb[:, :, 0:3]
@@ -224,10 +193,19 @@ def train_navigator_corrected(
             # --- Step 2: Navigator 直接预测手机坐标系下位移 ---
             pred_dp_body = navigator(xb_linear)
 
-            # --- Step 3: 用真值姿态把世界系位移旋回手机系作为监督 ---
-            R_abs_gt = quat_to_rotmat(yb_ori)
-            dp_body_gt = torch.matmul(R_abs_gt.transpose(1, 2), yb_dp.unsqueeze(-1)).squeeze(-1)
-            loss = F.mse_loss(pred_dp_body, dp_body_gt)
+            # --- Step 3: 用窗口起点姿态把世界系位移旋回手机系作为监督 ---
+            # q_rel = q_a^* ⊗ q_b  =>  R_b = R_a * R_rel  =>  R_a = R_b * R_rel^T
+            dp_body_gt = yb_dp
+            loss_body = F.mse_loss(pred_dp_body, dp_body_gt)
+            if joint_finetune:
+                R_rel_pred = quat_to_rotmat(pose_net(xb))
+                R_end = quat_to_rotmat(yb_ori)
+                R_start_pred = torch.matmul(R_end, R_rel_pred.transpose(1, 2))
+                dp_world_pred = torch.matmul(R_start_pred, pred_dp_body.unsqueeze(-1)).squeeze(-1)
+                loss_world = F.mse_loss(dp_world_pred, yb_dpw)
+                loss = loss_body + 1.0 * loss_world
+            else:
+                loss = loss_body
 
             
             optimizer.zero_grad()
@@ -247,16 +225,16 @@ def train_navigator_corrected(
         
         with torch.no_grad():
             for batch in val_loader:
-                xb, yb_dp, yb_ori, yb_rel, yb_align = batch
+                xb, yb_dp, yb_dpw, yb_ori, yb_rel, yb_align = batch
                 
                 acc_raw = xb[:, :, 3:6]
                 gyro_raw = xb[:, :, 0:3]
                 xb_linear = torch.cat([gyro_raw, acc_raw], dim=2)
                 
                 if joint_finetune:
-                    R_rel = fused_rotmat_from_gyro(xb, pose_net, dt=1.0 / 200.0)
+                    R_rel = quat_to_rotmat(pose_net(xb))
                 else:
-                    R_rel = pose_net(xb)
+                    R_rel = quat_to_rotmat(pose_net(xb))
                 q_anchor = quat_mul(quat_conj(yb_rel), yb_ori)
                 R_anchor = quat_to_rotmat(q_anchor)
                 R_abs_est = torch.matmul(R_anchor, R_rel)
@@ -264,9 +242,17 @@ def train_navigator_corrected(
                 xb_aligned = rotate_imu_by_matrix(xb_linear, R_abs_aligned)
                 
                 pred_dp_body = navigator(xb_linear)
-                R_abs_gt = quat_to_rotmat(yb_ori)
-                dp_body_gt = torch.matmul(R_abs_gt.transpose(1, 2), yb_dp.unsqueeze(-1)).squeeze(-1)
-                v_loss = F.mse_loss(pred_dp_body, dp_body_gt)
+                dp_body_gt = yb_dp
+                v_loss_body = F.mse_loss(pred_dp_body, dp_body_gt)
+                if joint_finetune:
+                    R_rel_pred = quat_to_rotmat(pose_net(xb))
+                    R_end = quat_to_rotmat(yb_ori)
+                    R_start_pred = torch.matmul(R_end, R_rel_pred.transpose(1, 2))
+                    dp_world_pred = torch.matmul(R_start_pred, pred_dp_body.unsqueeze(-1)).squeeze(-1)
+                    v_loss_world = F.mse_loss(dp_world_pred, yb_dpw)
+                    v_loss = v_loss_body + 1.0 * v_loss_world
+                else:
+                    v_loss = v_loss_body
                          
                 total_val_loss += v_loss.item() * xb.size(0)
                 val_cnt += xb.size(0)
@@ -290,32 +276,29 @@ def main():
     # 1. 加载数据
     print("\n📊 加载训练数据...")
     # PoseNet: 使用带重力加速度 (acce)
-    (x_tr_pose, _ylen_tr_pose, _yhead_tr_pose, yrel_tr_pose,
-     x_va_pose, _ylen_va_pose, _yhead_va_pose, yrel_va_pose) = load_data_2d_ridi_absheading(
+    (x_tr_pose, _ylen_tr_pose, yrel_tr_pose,
+     x_va_pose, _ylen_va_pose, yrel_va_pose) = load_data_ridi_absheading(
         ridi_root, device, window_size, stride,
         return_ori=False,
         return_rel_ori=True,
         return_delta_p=False,
         return_init=False,
-        use_abs_heading=False,
         acc_source="acce",
-        align_heading_to_init_pose=False,
     )
 
     # Navigator: 使用线性加速度 (linacce)
-    (x_tr, _ylen_tr, _yhead_tr, ydp_tr, yori_tr, yrel_tr, _yinit_tr, yalign_tr,
-     x_va, _ylen_va, _yhead_va, ydp_va, yori_va, yrel_va, _yinit_va, yalign_va) = load_data_2d_ridi_absheading(
+    (x_tr, _ylen_tr, ydp_tr, ydpw_tr, yori_tr, yrel_tr, _yinit_tr, yalign_tr,
+     x_va, _ylen_va, ydp_va, ydpw_va, yori_va, yrel_va, _yinit_va, yalign_va) = load_data_ridi_absheading(
         ridi_root, device, window_size, stride,
         return_ori=True,        # 用于去重力
         return_rel_ori=True,    # 用于 PoseNet 训练
         return_delta_p=True,    # 用于 Navigator 训练标签
+        return_delta_p_world=True,
         return_init=True,       # 用于 Navigator 输入对齐 (绝对姿态锚点)
-        use_abs_heading=False,
         align_init_quat=True,
         align_init_quat_to_labels=False,
         return_align=True,
         acc_source="linacce",
-        align_heading_to_init_pose=False,
     )
     
     # PoseNet 数据集
@@ -323,8 +306,8 @@ def main():
     pose_loader = DataLoader(pose_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
     
     # Navigator 数据集 (新增 yinit_tr)
-    nav_train_ds = TensorDataset(x_tr, ydp_tr, yori_tr, yrel_tr, yalign_tr)
-    nav_val_ds = TensorDataset(x_va, ydp_va, yori_va, yrel_va, yalign_va)
+    nav_train_ds = TensorDataset(x_tr, ydp_tr, ydpw_tr, yori_tr, yrel_tr, yalign_tr)
+    nav_val_ds = TensorDataset(x_va, ydp_va, ydpw_va, yori_va, yrel_va, yalign_va)
     
     nav_train_loader = DataLoader(nav_train_ds, batch_size=batch_size, shuffle=True, drop_last=True)
     nav_val_loader = DataLoader(nav_val_ds, batch_size=batch_size, shuffle=False)

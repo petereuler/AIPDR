@@ -22,7 +22,7 @@ def len_loss(pred, target):
 
 
 # ======= 数据加载函数 =======
-def load_data_2d_oxiod(data_root, device, window_size=160, stride=32):
+def load_data_oxiod(data_root, device, window_size=160, stride=32):
     """
     加载 OXIOD 数据集并分割为训练集和验证集
     
@@ -68,11 +68,10 @@ def load_data_2d_oxiod(data_root, device, window_size=160, stride=32):
     xg_va, xa_va, yl_va, yh_va = [], [], [], []
     
     for imu, gt in zip(imu_files, gt_files):
-        gyro, acc, pos3d, ori = load_oxiod_raw(imu, gt)
+        gyro, acc, pos_xyz, ori = load_oxiod_raw(imu, gt)
         
         [gx, ax], [dl, dh], _, _ = oxiod_window(
-            gyro, acc, pos3d, ori,
-            mode="2d",
+            gyro, acc, pos_xyz, ori,
             window_size=window_size,
             stride=stride,
             filter_window=20,
@@ -107,7 +106,7 @@ def load_data_2d_oxiod(data_root, device, window_size=160, stride=32):
     return x_tr, ylen_tr, yhead_tr, x_va, ylen_va, yhead_va
 
 
-def load_data_2d_selfmade(selfmade_root, device, window_size=160, stride=32):
+def load_data_selfmade(selfmade_root, device, window_size=160, stride=32):
     """
     加载 SELFMADE 数据集并分割为训练集和验证集
     
@@ -142,11 +141,10 @@ def load_data_2d_selfmade(selfmade_root, device, window_size=160, stride=32):
     xg_tr, xa_tr, yl_tr, yh_tr = [], [], [], []
     xg_va, xa_va, yl_va, yh_va = [], [], [], []
     for fp in files:
-        gyro, acc, pos3d, ori = load_selfmade_raw(fp)
+        gyro, acc, pos_xyz, ori = load_selfmade_raw(fp)
         
         [gx, ax], [dl, dh], _, _ = selfmade_window(
-            gyro, acc, pos3d, ori,
-            mode="2d",
+            gyro, acc, pos_xyz, ori,
             window_size=window_size,
             stride=stride,
             filter_window=10,
@@ -186,7 +184,7 @@ def load_data_2d_selfmade(selfmade_root, device, window_size=160, stride=32):
     return x_tr, ylen_tr, yhead_tr, x_va, ylen_va, yhead_va
 
 
-def load_data_2d_ronin(ronin_root, device, window_size=160, stride=32):
+def load_data_ronin(ronin_root, device, window_size=160, stride=32):
     """
     加载 RONIN 数据集并分割为训练集和验证集
     
@@ -218,10 +216,10 @@ def load_data_2d_ronin(ronin_root, device, window_size=160, stride=32):
     xg_tr, xa_tr, yl_tr, yh_tr = [], [], [], []
     xg_va, xa_va, yl_va, yh_va = [], [], [], []
     for d in train_dirs:
-        gyro, acc, pos3d, ori = load_ronin_raw(d)
+        gyro, acc, pos_xyz, ori = load_ronin_raw(d)
         
         [gx, ax], [dl, dh], _, _ = ronin_window(
-            gyro, acc, pos3d, ori, mode='2d', window_size=window_size, stride=stride, filter_window=20,
+            gyro, acc, pos_xyz, ori, window_size=window_size, stride=stride, filter_window=20,
             smooth_heading=True,  # 启用航向角平滑，提高真值轨迹光滑性
             heading_sigma=1.5,    # 航向角高斯平滑标准差
             smooth_length=False,  # 不平滑步长，只平滑航向
@@ -231,10 +229,10 @@ def load_data_2d_ronin(ronin_root, device, window_size=160, stride=32):
             continue
         xg_tr.append(gx); xa_tr.append(ax); yl_tr.append(dl); yh_tr.append(dh)
     for d in val_dirs:
-        gyro, acc, pos3d, ori = load_ronin_raw(d)
+        gyro, acc, pos_xyz, ori = load_ronin_raw(d)
         
         [gx, ax], [dl, dh], _, _ = ronin_window(
-            gyro, acc, pos3d, ori, mode='2d', window_size=window_size, stride=stride, filter_window=20,
+            gyro, acc, pos_xyz, ori, window_size=window_size, stride=stride, filter_window=20,
             smooth_heading=True,  # 启用航向角平滑，提高真值轨迹光滑性
             heading_sigma=1.25,    # 航向角高斯平滑标准差
             smooth_length=False,  # 不平滑步长，只平滑航向
@@ -257,9 +255,9 @@ def load_data_2d_ronin(ronin_root, device, window_size=160, stride=32):
     return x_tr, ylen_tr, yhead_tr, x_va, ylen_va, yhead_va
 
 
-def load_data_2d_ridi(ridi_root, device, window_size=160, stride=32):
+def load_data_ridi(ridi_root, device, window_size=160, stride=32):
     """
-    加载 RIDI 数据集并分割为训练集和验证集
+    加载 RIDI 数据集并分割为训练集和验证集，返回 3D 路径长度标签（不包含 heading）
 
     Args:
         ridi_root: RIDI 数据集根目录
@@ -269,7 +267,7 @@ def load_data_2d_ridi(ridi_root, device, window_size=160, stride=32):
         使用官方发布的 train/test 列表划分
 
     Returns:
-        x_tr, ylen_tr, yhead_tr, x_va, ylen_va, yhead_va
+        x_tr, ylen_tr, x_va, ylen_va
     """
     data_root = os.path.join(ridi_root, "data")
     train_list = os.path.join(data_root, "list_train_publish_v2.txt")
@@ -290,22 +288,19 @@ def load_data_2d_ridi(ridi_root, device, window_size=160, stride=32):
     train_names = _load_list(train_list)
     val_names = _load_list(test_list)
 
-    xg_tr, xa_tr, yl_tr, yh_tr = [], [], [], []
-    xg_va, xa_va, yl_va, yh_va = [], [], [], []
+    xg_tr, xa_tr, yl_tr = [], [], []
+    xg_va, xa_va, yl_va = [], [], []
 
     for name in train_names + val_names:
         seq_dir = os.path.join(data_root, name)
         if not os.path.isdir(seq_dir):
             continue
-        gyro, acc, pos3d, ori = load_ridi_raw(seq_dir)
-        [gx, ax], [dl, dh], _, _ = ridi_window(
-            gyro, acc, pos3d, ori,
-            mode="2d",
+        gyro, acc, pos_xyz, ori = load_ridi_raw(seq_dir)
+        [gx, ax], [dl], _, _ = ridi_window(
+            gyro, acc, pos_xyz, ori,
             window_size=window_size,
             stride=stride,
             filter_window=20,
-            smooth_heading=False,
-            heading_sigma=1.5,
             smooth_length=False,
             length_sigma=1.0,
         )
@@ -313,31 +308,27 @@ def load_data_2d_ridi(ridi_root, device, window_size=160, stride=32):
             xg_va.append(gx)
             xa_va.append(ax)
             yl_va.append(dl)
-            yh_va.append(dh)
         else:
             xg_tr.append(gx)
             xa_tr.append(ax)
             yl_tr.append(dl)
-            yh_tr.append(dh)
 
     x_tr = np.concatenate(xg_tr, axis=0)
     x_tr = np.concatenate([x_tr, np.concatenate(xa_tr, axis=0)], axis=-1)
     x_tr = torch.tensor(x_tr, dtype=torch.float32, device=device)
     ylen_tr = torch.tensor(np.concatenate(yl_tr, axis=0), dtype=torch.float32, device=device)
-    yhead_tr = torch.tensor(np.concatenate(yh_tr, axis=0), dtype=torch.float32, device=device)
 
     x_va = np.concatenate(xg_va, axis=0)
     x_va = np.concatenate([x_va, np.concatenate(xa_va, axis=0)], axis=-1)
     x_va = torch.tensor(x_va, dtype=torch.float32, device=device)
     ylen_va = torch.tensor(np.concatenate(yl_va, axis=0), dtype=torch.float32, device=device)
-    yhead_va = torch.tensor(np.concatenate(yh_va, axis=0), dtype=torch.float32, device=device)
 
-    return x_tr, ylen_tr, yhead_tr, x_va, ylen_va, yhead_va
+    return x_tr, ylen_tr, x_va, ylen_va
 
 
-def load_data_2d_ridi_absheading(ridi_root, device, window_size=160, stride=32, return_ori=False, return_rel_ori=False, return_seq=False, return_init=False, return_delta_p=False, use_abs_heading=True, smooth_heading=False, heading_sigma=1.5, align_init_quat=False, acc_source="acce", align_init_quat_to_labels=True, return_align=False, align_heading_to_init_pose=True):
+def load_data_ridi_absheading(ridi_root, device, window_size=160, stride=32, return_ori=False, return_rel_ori=False, return_seq=False, return_init=False, return_delta_p=False, return_delta_p_world=False, align_init_quat=False, acc_source="acce", align_init_quat_to_labels=True, return_align=False):
     """
-    加载 RIDI 数据集并分割为训练/验证，返回绝对航向标签
+    加载 RIDI 数据集并分割为训练/验证，返回 3D 标签（不包含 heading）
     """
     data_root = os.path.join(ridi_root, "data")
     train_list = os.path.join(data_root, "list_train_publish_v2.txt")
@@ -358,8 +349,8 @@ def load_data_2d_ridi_absheading(ridi_root, device, window_size=160, stride=32, 
     train_names = _load_list(train_list)
     val_names = _load_list(test_list)
 
-    xg_tr, xa_tr, yl_tr, ya_tr, yp_tr, yo_tr, yr_tr, yi_tr, yalign_tr = [], [], [], [], [], [], [], [], []
-    xg_va, xa_va, yl_va, ya_va, yp_va, yo_va, yr_va, yi_va, yalign_va = [], [], [], [], [], [], [], [], []
+    xg_tr, xa_tr, yl_tr, yp_tr, ypw_tr, yo_tr, yr_tr, yi_tr, yalign_tr = [], [], [], [], [], [], [], [], []
+    xg_va, xa_va, yl_va, yp_va, ypw_va, yo_va, yr_va, yi_va, yalign_va = [], [], [], [], [], [], [], [], []
     seq_tr = []
     seq_va = []
 
@@ -404,135 +395,58 @@ def load_data_2d_ridi_absheading(ridi_root, device, window_size=160, stride=32, 
         seq_dir = os.path.join(data_root, name)
         if not os.path.isdir(seq_dir):
             continue
-        gyro, acc, pos3d, ori = load_ridi_raw(seq_dir, acc_source=acc_source)
+        gyro, acc, pos_xyz, ori = load_ridi_raw(seq_dir, acc_source=acc_source)
         q_align = None
         R_align = None
         if align_init_quat:
             q0 = ori[0].astype(np.float32)
             q_align = _quat_conj_batch(q0)[0]
             R_align = _quat_to_rotmat(q_align)
-        # compute init rotation aligned to chord frame using sequence-level yaw offset
-        pos2d = pos3d[:, :2]
+
         max_start = gyro.shape[0] - window_size - 1
         b_indices = []
-        a_indices = []
         for idx in range(0, max_start, stride):
-            a = idx + window_size // 2 - stride // 2
             b = idx + window_size // 2 + stride // 2
-            a = max(0, min(a, len(pos2d) - 1))
-            b = max(0, min(b, len(pos2d) - 1))
-            a_indices.append(a)
+            b = max(0, min(b, len(pos_xyz) - 1))
             b_indices.append(b)
-        a_indices = np.array(a_indices, dtype=np.int64)
         b_indices = np.array(b_indices, dtype=np.int64)
 
-        if return_rel_ori and return_ori and return_delta_p:
-            [gx, ax], [dl, y_head, abs_h, dori, drel, dp], _, init_head = ridi_window(
-                gyro, acc, pos3d, ori,
-                mode="2d",
-                window_size=window_size,
-                stride=stride,
-                filter_window=0,
-                smooth_heading=smooth_heading,
-                heading_sigma=heading_sigma,
-                smooth_length=False,
-                length_sigma=1.0,
-                return_abs_heading=True,
-                return_ori=True,
-                return_rel_ori=True,
-                return_delta_p=True,
-                abs_heading_from_ori=False,
-                align_heading_to_init_pose=align_heading_to_init_pose,
-            )
-        elif return_rel_ori and return_delta_p:
-            [gx, ax], [dl, y_head, abs_h, drel, dp], _, init_head = ridi_window(
-                gyro, acc, pos3d, ori,
-                mode="2d",
-                window_size=window_size,
-                stride=stride,
-                filter_window=0,
-                smooth_heading=smooth_heading,
-                heading_sigma=heading_sigma,
-                smooth_length=False,
-                length_sigma=1.0,
-                return_abs_heading=True,
-                return_rel_ori=True,
-                return_delta_p=True,
-                abs_heading_from_ori=False,
-                align_heading_to_init_pose=align_heading_to_init_pose,
-            )
-        elif return_rel_ori and return_ori:
-            [gx, ax], [dl, y_head, abs_h, dori, drel], _, init_head = ridi_window(
-                gyro, acc, pos3d, ori,
-                mode="2d",
-                window_size=window_size,
-                stride=stride,
-                filter_window=0,
-                smooth_heading=smooth_heading,
-                heading_sigma=heading_sigma,
-                smooth_length=False,
-                length_sigma=1.0,
-                return_abs_heading=True,
-                return_ori=True,
-                return_rel_ori=True,
-                abs_heading_from_ori=False,
-                align_heading_to_init_pose=align_heading_to_init_pose,
-            )
-        elif return_rel_ori:
-            [gx, ax], [dl, y_head, abs_h, drel], _, init_head = ridi_window(
-                gyro, acc, pos3d, ori,
-                mode="2d",
-                window_size=window_size,
-                stride=stride,
-                filter_window=0,
-                smooth_heading=smooth_heading,
-                heading_sigma=heading_sigma,
-                smooth_length=False,
-                length_sigma=1.0,
-                return_abs_heading=True,
-                return_rel_ori=True,
-                abs_heading_from_ori=False,
-                align_heading_to_init_pose=align_heading_to_init_pose,
-            )
-        elif return_delta_p:
-            [gx, ax], [dl, y_head, abs_h, dp], _, init_head = ridi_window(
-                gyro, acc, pos3d, ori,
-                mode="2d",
-                window_size=window_size,
-                stride=stride,
-                filter_window=0,
-                smooth_heading=smooth_heading,
-                heading_sigma=heading_sigma,
-                smooth_length=False,
-                length_sigma=1.0,
-                return_abs_heading=True,
-                return_delta_p=True,
-                abs_heading_from_ori=False,
-                align_heading_to_init_pose=align_heading_to_init_pose,
-            )
-        else:
-            [gx, ax], [dl, y_head, abs_h], _, init_head = ridi_window(
-            gyro, acc, pos3d, ori,
-            mode="2d",
+        [gx, ax], labels, _, _ = ridi_window(
+            gyro, acc, pos_xyz, ori,
             window_size=window_size,
             stride=stride,
             filter_window=0,
-            smooth_heading=smooth_heading,
-            heading_sigma=heading_sigma,
             smooth_length=False,
             length_sigma=1.0,
-            return_abs_heading=True,
-            abs_heading_from_ori=False,
-            align_heading_to_init_pose=align_heading_to_init_pose,
-            )
+            return_ori=return_ori,
+            return_rel_ori=return_rel_ori,
+            return_delta_p=return_delta_p,
+            return_delta_p_world=return_delta_p_world,
+        )
 
-        if align_init_quat_to_labels and align_init_quat and dp is not None and dp.shape[1] == 3:
-            dp = (R_align @ dp.T).T
+        dl = labels[0]
+        label_idx = 1
+        dori = None
+        if return_ori:
+            dori = labels[label_idx]
+            label_idx += 1
+        drel = None
+        if return_rel_ori:
+            drel = labels[label_idx]
+            label_idx += 1
+        dp = None
+        if return_delta_p:
+            dp = labels[label_idx]
+            label_idx += 1
+        dp_world = None
+        if return_delta_p_world:
+            dp_world = labels[label_idx]
+            label_idx += 1
+
         if align_init_quat_to_labels and align_init_quat and return_ori:
             dori = _quat_mul_batch(q_align, dori)
 
         init_q = ori[b_indices[0]].astype(np.float32)
-        # quat to rot
         iw, ix, iy, iz = init_q
         ww = iw * iw
         xx = ix * ix
@@ -549,23 +463,18 @@ def load_data_2d_ridi_absheading(ridi_root, device, window_size=160, stride=32, 
             [2 * (xy + wz), ww - xx + yy - zz, 2 * (yz - wx)],
             [2 * (xz - wy), 2 * (yz + wx), ww - xx - yy + zz],
         ], dtype=np.float32)
-        yaw_b2w = np.arctan2(Rq[1, 0], Rq[0, 0])
-        diff = init_head - yaw_b2w
-        yaw_offset = np.arctan2(np.sin(diff), np.cos(diff))
-        cz = np.cos(yaw_offset)
-        sz = np.sin(yaw_offset)
-        Rz = np.array([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
-        init_rot = Rz @ Rq
+        init_rot = Rq
         if align_init_quat_to_labels and align_init_quat and return_init:
             init_rot = R_align @ init_rot
-        heading_label = abs_h if use_abs_heading else y_head
+
         if name in val_names:
             xg_va.append(gx)
             xa_va.append(ax)
             yl_va.append(dl)
-            ya_va.append(heading_label)
             if return_delta_p:
                 yp_va.append(dp)
+            if return_delta_p_world:
+                ypw_va.append(dp_world)
             if return_ori:
                 yo_va.append(dori)
             if return_rel_ori:
@@ -580,9 +489,10 @@ def load_data_2d_ridi_absheading(ridi_root, device, window_size=160, stride=32, 
             xg_tr.append(gx)
             xa_tr.append(ax)
             yl_tr.append(dl)
-            ya_tr.append(heading_label)
             if return_delta_p:
                 yp_tr.append(dp)
+            if return_delta_p_world:
+                ypw_tr.append(dp_world)
             if return_ori:
                 yo_tr.append(dori)
             if return_rel_ori:
@@ -598,10 +508,12 @@ def load_data_2d_ridi_absheading(ridi_root, device, window_size=160, stride=32, 
     x_tr = np.concatenate([x_tr, np.concatenate(xa_tr, axis=0)], axis=-1)
     x_tr = torch.tensor(x_tr, dtype=torch.float32, device=device)
     ylen_tr = torch.tensor(np.concatenate(yl_tr, axis=0), dtype=torch.float32, device=device)
-    yabs_tr = torch.tensor(np.concatenate(ya_tr, axis=0), dtype=torch.float32, device=device)
     ydp_tr = None
     if return_delta_p:
         ydp_tr = torch.tensor(np.concatenate(yp_tr, axis=0), dtype=torch.float32, device=device)
+    ydpw_tr = None
+    if return_delta_p_world:
+        ydpw_tr = torch.tensor(np.concatenate(ypw_tr, axis=0), dtype=torch.float32, device=device)
     yori_tr = None
     if return_ori:
         yori_tr = torch.tensor(np.concatenate(yo_tr, axis=0), dtype=torch.float32, device=device)
@@ -622,10 +534,12 @@ def load_data_2d_ridi_absheading(ridi_root, device, window_size=160, stride=32, 
     x_va = np.concatenate([x_va, np.concatenate(xa_va, axis=0)], axis=-1)
     x_va = torch.tensor(x_va, dtype=torch.float32, device=device)
     ylen_va = torch.tensor(np.concatenate(yl_va, axis=0), dtype=torch.float32, device=device)
-    yabs_va = torch.tensor(np.concatenate(ya_va, axis=0), dtype=torch.float32, device=device)
     ydp_va = None
     if return_delta_p:
         ydp_va = torch.tensor(np.concatenate(yp_va, axis=0), dtype=torch.float32, device=device)
+    ydpw_va = None
+    if return_delta_p_world:
+        ydpw_va = torch.tensor(np.concatenate(ypw_va, axis=0), dtype=torch.float32, device=device)
     yori_va = None
     if return_ori:
         yori_va = torch.tensor(np.concatenate(yo_va, axis=0), dtype=torch.float32, device=device)
@@ -642,9 +556,11 @@ def load_data_2d_ridi_absheading(ridi_root, device, window_size=160, stride=32, 
     if return_align and align_init_quat:
         yalign_va_t = torch.tensor(np.concatenate(yalign_va, axis=0), dtype=torch.float32, device=device)
 
-    outputs = [x_tr, ylen_tr, yabs_tr]
+    outputs = [x_tr, ylen_tr]
     if return_delta_p:
         outputs.append(ydp_tr)
+    if return_delta_p_world:
+        outputs.append(ydpw_tr)
     if return_ori:
         outputs.append(yori_tr)
     if return_rel_ori:
@@ -655,9 +571,11 @@ def load_data_2d_ridi_absheading(ridi_root, device, window_size=160, stride=32, 
         outputs.append(yinit_tr)
     if return_align and align_init_quat:
         outputs.append(yalign_tr_t)
-    outputs += [x_va, ylen_va, yabs_va]
+    outputs += [x_va, ylen_va]
     if return_delta_p:
         outputs.append(ydp_va)
+    if return_delta_p_world:
+        outputs.append(ydpw_va)
     if return_ori:
         outputs.append(yori_va)
     if return_rel_ori:
@@ -669,6 +587,7 @@ def load_data_2d_ridi_absheading(ridi_root, device, window_size=160, stride=32, 
     if return_align and align_init_quat:
         outputs.append(yalign_va_t)
     return tuple(outputs)
+
 
 
 

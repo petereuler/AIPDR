@@ -1,6 +1,6 @@
 import numpy as np
 
-def generate_trajectory_2d(init_p, init_h, delta_l_list, delta_h_list):
+def generate_trajectory(init_p, init_h, delta_l_list, delta_h_list):
     """
     使用步长（Δl）与航向角增量（Δψ）在平面内重建轨迹
     """

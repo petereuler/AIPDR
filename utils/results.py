@@ -42,7 +42,7 @@ def reconstruct_from_absolute_angles(init_pos, step_lengths, absolute_angles):
 
 
 
-def extract_ground_truth_positions(pos3d, window_size, stride, num_windows, init_l):
+def extract_ground_truth_positions(pos_xyz, window_size, stride, num_windows, init_l):
     """
     从真值位置数据中提取与窗口对应的位置
     
@@ -55,7 +55,7 @@ def extract_ground_truth_positions(pos3d, window_size, stride, num_windows, init
     - 我们使用 b 位置作为该窗口的代表位置
     
     Args:
-        pos3d: 真值3D位置数据 (N, 3)
+        pos_xyz: 真值位置数据 (N, 3)
         window_size: 窗口大小
         stride: 步长
         num_windows: 窗口数量
@@ -64,7 +64,7 @@ def extract_ground_truth_positions(pos3d, window_size, stride, num_windows, init
     Returns:
         gt_positions: 每个窗口对应的真值位置 (num_windows, 2)
     """
-    pos2d = pos3d[:, :2]
+    pos_xy = pos_xyz[:, :2]
     gt_positions = [init_l]  # 第一个位置是初始位置
     
     for i in range(num_windows - 1):  # 从第二个窗口开始
@@ -72,8 +72,8 @@ def extract_ground_truth_positions(pos3d, window_size, stride, num_windows, init
         # 计算窗口对应的位置索引 b
         b = idx + window_size // 2 + stride // 2
         # 确保索引在有效范围内
-        b = min(max(0, b), len(pos2d) - 1)
-        gt_positions.append(pos2d[b])
+        b = min(max(0, b), len(pos_xy) - 1)
+        gt_positions.append(pos_xy[b])
     
     return np.array(gt_positions)
 
@@ -119,4 +119,3 @@ def save_results_to_csv(gt_vis, pred_vis, traj_pdr, dl, dh, pred_len, pred_head,
         "pred_dh": pred_head[:vis_num, 0],
     })
     df_time.to_csv(os.path.join(output_dir, f"{base_name}_time_series.csv"), index=False)
-
