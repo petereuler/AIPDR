@@ -6,19 +6,20 @@
 !models/
 !src/
 !utils/
-!tools/
-
 
 # Allow files inside these directories
 !data/**
 !models/**
 !src/**
 !utils/**
-!tools/**
 
 # Allow core python files
-!trainc.py
-!testc.py
+!posenet_test.py
+!train.py
+!test.py
 
 # Allow gitignore itself
 !.gitignore
+
+# Allow README.md
+!README.md

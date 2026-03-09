@@ -5,28 +5,32 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
-from models.pose_net import PoseNetTransformer, quat_conj, quat_mul, quat_to_rotmat
+from models.posenet import PoseNetTransformer, quat_conj, quat_mul, quat_to_rotmat
 from models.navigator import Navigator
-from utils.training_utils import load_data_ridi_absheading
+from utils.training_utils import load_data_oxiod_absheading, load_data_ridi_absheading
 
 # ======= 参数设置 =======
 window_size = 64   # 约 1.6s ~ 3.2s
 stride = 64
 batch_size = 1024
 feat_dim = 64
+# 可选: "RIDI" / "OXIOD"
+DATASET = "RIDI"
 
 # 优化器参数
 lr = 1e-4
 weight_decay = 1e-4
-epochs = 200
-pose_epochs = 200
-nav_epochs = 200
-joint_epochs = 200
+epochs = 20
+pose_epochs = 20
+nav_epochs = 20
+joint_epochs = 20
 
 # 路径设置
-project_dir = "/home/admin407/code/zyshe/NavCorrector"
+project_dir = os.path.dirname(os.path.abspath(__file__))
 ridi_root = os.path.join(project_dir, "RIDI")
-ckpt_dir = os.path.join(project_dir, "checkpoints_cls")
+oxiod_root = os.path.join(project_dir, "OXIOD")
+dataset_name = os.getenv("DATASET", DATASET).upper()
+ckpt_dir = os.path.join(project_dir, "checkpoints", dataset_name.lower())
 os.makedirs(ckpt_dir, exist_ok=True)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -71,28 +75,28 @@ def rotate_imu_by_matrix(imu_seq, R_mat):
 
 # ======= 训练函数 =======
 
-def train_pose_net(pose_net, train_loader):
-    """Stage 1: 训练 PoseNet (保持不变)"""
-    optimizer = optim.AdamW(pose_net.parameters(), lr=lr, weight_decay=weight_decay)
-    ckpt = os.path.join(ckpt_dir, "pose_net.pth")
+def train_posenet(posenet, train_loader):
+    """Stage 1: 训练 posenet。"""
+    optimizer = optim.AdamW(posenet.parameters(), lr=lr, weight_decay=weight_decay)
+    ckpt = os.path.join(ckpt_dir, "posenet.pth")
     
     if os.path.exists(ckpt):
         print(f"[Pose] 发现检查点 {ckpt}，尝试加载...")
         try:
-            pose_net.load_state_dict(torch.load(ckpt))
+            posenet.load_state_dict(torch.load(ckpt))
             print("[Pose] 加载成功")
         except:
             print("[Pose] 加载失败，重新训练")
 
-    # 初始化 best_loss 为当前模型在训练集上的loss，确保从已训权重继续改进
+    # 先用当前权重在训练集上估计基线 loss，便于从已有 checkpoint 继续训练。
     best_loss = float("inf")
-    pose_net.eval()
+    posenet.eval()
     with torch.no_grad():
         total = 0.0
         cnt = 0
         for batch in train_loader:
             xb, yb_rel = batch[0], batch[1]
-            q_fused = pose_net(xb)
+            q_fused = posenet(xb)
             q_gt = yb_rel / (yb_rel.norm(dim=1, keepdim=True) + 1e-8)
             dot = torch.abs(torch.sum(q_fused * q_gt, dim=1))
             loss = torch.mean(1.0 - dot)
@@ -101,24 +105,24 @@ def train_pose_net(pose_net, train_loader):
             cnt += bs
         if cnt > 0:
             best_loss = total / cnt
-    pose_net.train()
+    posenet.train()
     print(f"[Pose] 开始训练... (Epochs: {pose_epochs})")
     
     for ep in range(pose_epochs):
         t0 = time.time()
-        pose_net.train()
+        posenet.train()
         total = 0.0
         cnt = 0
         for batch in train_loader:
             xb, yb_rel = batch[0], batch[1]
-            q_fused = pose_net(xb)
+            q_fused = posenet(xb)
             q_gt = yb_rel / (yb_rel.norm(dim=1, keepdim=True) + 1e-8)
             dot = torch.abs(torch.sum(q_fused * q_gt, dim=1))
             loss = torch.mean(1.0 - dot)
             
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(pose_net.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(posenet.parameters(), 1.0)
             optimizer.step()
             
             bs = xb.size(0)
@@ -128,14 +132,14 @@ def train_pose_net(pose_net, train_loader):
         avg_loss = total / max(cnt, 1)
         if avg_loss < best_loss:
             best_loss = avg_loss
-            torch.save(pose_net.state_dict(), ckpt)
+            torch.save(posenet.state_dict(), ckpt)
             
         if (ep + 1) % 10 == 0 or ep == 0:
             print(f"[Pose Ep {ep+1}] Loss: {avg_loss:.6f} | Time: {time.time()-t0:.1f}s")
 
 
-def train_navigator_corrected(
-    pose_net,
+def train_navigator(
+    posenet,
     navigator,
     train_loader,
     val_loader,
@@ -144,18 +148,12 @@ def train_navigator_corrected(
     num_epochs=None,
     phase_name="Navigator",
 ):
-    """
-    Stage 2: 训练 Navigator (修复坐标系对齐)
-    改进点：
-    1. 使用 q_start (yb_init) 作为绝对锚点。
-    2. R_abs = R_init @ R_rel (PoseNet预测)。
-    3. 将 Linear Acc 旋转到 R_abs 定义的世界系。
-    """
+    """训练 navigator，可选联合微调 posenet。"""
     if joint_finetune:
         optimizer = optim.AdamW(
             [
                 {"params": navigator.parameters(), "lr": lr},
-                {"params": pose_net.parameters(), "lr": lr * pose_lr_scale},
+                {"params": posenet.parameters(), "lr": lr * pose_lr_scale},
             ],
             weight_decay=weight_decay,
         )
@@ -164,9 +162,9 @@ def train_navigator_corrected(
     ckpt = os.path.join(ckpt_dir, "navigator.pth")
     
     if joint_finetune:
-        pose_net.train()
+        posenet.train()
     else:
-        pose_net.eval()
+        posenet.eval()
     
     best_loss = float("inf")
     num_epochs = epochs if num_epochs is None else num_epochs
@@ -178,32 +176,31 @@ def train_navigator_corrected(
         train_cnt = 0
         
         for batch in train_loader:
-            # xb: Raw IMU
-            # yb_dp: GT Displacement (Global Frame)
-            # yb_ori: GT Orientation at window end (For Gravity Removal / Anchor)
-            # yb_rel: GT Relative Orientation (qa^-1 * qb)
+            # xb: IMU 窗口
+            # yb_dp: 手机坐标系位移标签
+            # yb_dpw: 世界坐标系位移标签
+            # yb_ori / yb_rel: 用于联合训练时的姿态监督
             xb, yb_dp, yb_dpw, yb_ori, yb_rel, yb_align = batch
             
             acc_raw = xb[:, :, 3:6]
             gyro_raw = xb[:, :, 0:3]
             
-            # --- Step 1: 使用线性加速度（数据集提供），保持在手机坐标系 ---
+            # Step 1: 使用数据集提供的线性加速度，输入保持在手机坐标系。
             xb_linear = torch.cat([gyro_raw, acc_raw], dim=2)
 
-            # --- Step 2: Navigator 直接预测手机坐标系下位移 ---
+            # Step 2: navigator 预测手机坐标系位移。
             pred_dp_body = navigator(xb_linear)
 
-            # --- Step 3: 用窗口起点姿态把世界系位移旋回手机系作为监督 ---
-            # q_rel = q_a^* ⊗ q_b  =>  R_b = R_a * R_rel  =>  R_a = R_b * R_rel^T
+            # Step 3: 联合训练时再通过姿态把 body 位移转回世界系做监督。
             dp_body_gt = yb_dp
             loss_body = F.mse_loss(pred_dp_body, dp_body_gt)
             if joint_finetune:
-                R_rel_pred = quat_to_rotmat(pose_net(xb))
+                R_rel_pred = quat_to_rotmat(posenet(xb))
                 R_end = quat_to_rotmat(yb_ori)
                 R_start_pred = torch.matmul(R_end, R_rel_pred.transpose(1, 2))
                 dp_world_pred = torch.matmul(R_start_pred, pred_dp_body.unsqueeze(-1)).squeeze(-1)
                 loss_world = F.mse_loss(dp_world_pred, yb_dpw)
-                loss = loss_body + 1.0 * loss_world
+                loss = loss_world
             else:
                 loss = loss_body
 
@@ -216,7 +213,7 @@ def train_navigator_corrected(
             train_cnt += xb.size(0)
             total_train_loss += loss.item() * xb.size(0)
 
-        # --- Validation ---
+        # Validation
         avg_train_loss = total_train_loss / max(train_cnt, 1)
         
         navigator.eval()
@@ -232,9 +229,9 @@ def train_navigator_corrected(
                 xb_linear = torch.cat([gyro_raw, acc_raw], dim=2)
                 
                 if joint_finetune:
-                    R_rel = quat_to_rotmat(pose_net(xb))
+                    R_rel = quat_to_rotmat(posenet(xb))
                 else:
-                    R_rel = quat_to_rotmat(pose_net(xb))
+                    R_rel = quat_to_rotmat(posenet(xb))
                 q_anchor = quat_mul(quat_conj(yb_rel), yb_ori)
                 R_anchor = quat_to_rotmat(q_anchor)
                 R_abs_est = torch.matmul(R_anchor, R_rel)
@@ -245,12 +242,12 @@ def train_navigator_corrected(
                 dp_body_gt = yb_dp
                 v_loss_body = F.mse_loss(pred_dp_body, dp_body_gt)
                 if joint_finetune:
-                    R_rel_pred = quat_to_rotmat(pose_net(xb))
+                    R_rel_pred = quat_to_rotmat(posenet(xb))
                     R_end = quat_to_rotmat(yb_ori)
                     R_start_pred = torch.matmul(R_end, R_rel_pred.transpose(1, 2))
                     dp_world_pred = torch.matmul(R_start_pred, pred_dp_body.unsqueeze(-1)).squeeze(-1)
                     v_loss_world = F.mse_loss(dp_world_pred, yb_dpw)
-                    v_loss = v_loss_body + 1.0 * v_loss_world
+                    v_loss = v_loss_world
                 else:
                     v_loss = v_loss_body
                          
@@ -270,42 +267,67 @@ def train_navigator_corrected(
 
 def main():
     print("=" * 60)
-    print("NavCorrector: PoseNet + Polar Navigator (Fixed Absolute Alignment)")
+    print(f"NavCorrector: PoseNet + Polar Navigator (Dataset={dataset_name})")
     print("=" * 60)
 
     # 1. 加载数据
     print("\n📊 加载训练数据...")
-    # PoseNet: 使用带重力加速度 (acce)
-    (x_tr_pose, _ylen_tr_pose, yrel_tr_pose,
-     x_va_pose, _ylen_va_pose, yrel_va_pose) = load_data_ridi_absheading(
-        ridi_root, device, window_size, stride,
-        return_ori=False,
-        return_rel_ori=True,
-        return_delta_p=False,
-        return_init=False,
-        acc_source="acce",
-    )
+    if dataset_name == "RIDI":
+        # posenet 使用带重力加速度 (acce)
+        (x_tr_pose, _ylen_tr_pose, yrel_tr_pose,
+         x_va_pose, _ylen_va_pose, yrel_va_pose) = load_data_ridi_absheading(
+            ridi_root, device, window_size, stride,
+            return_ori=False,
+            return_rel_ori=True,
+            return_delta_p=False,
+            return_init=False,
+            acc_source="acce",
+        )
 
-    # Navigator: 使用线性加速度 (linacce)
-    (x_tr, _ylen_tr, ydp_tr, ydpw_tr, yori_tr, yrel_tr, _yinit_tr, yalign_tr,
-     x_va, _ylen_va, ydp_va, ydpw_va, yori_va, yrel_va, _yinit_va, yalign_va) = load_data_ridi_absheading(
-        ridi_root, device, window_size, stride,
-        return_ori=True,        # 用于去重力
-        return_rel_ori=True,    # 用于 PoseNet 训练
-        return_delta_p=True,    # 用于 Navigator 训练标签
-        return_delta_p_world=True,
-        return_init=True,       # 用于 Navigator 输入对齐 (绝对姿态锚点)
-        align_init_quat=True,
-        align_init_quat_to_labels=False,
-        return_align=True,
-        acc_source="linacce",
-    )
+        # navigator 使用线性加速度 (linacce)
+        (x_tr, _ylen_tr, ydp_tr, ydpw_tr, yori_tr, yrel_tr, _yinit_tr, yalign_tr,
+         x_va, _ylen_va, ydp_va, ydpw_va, yori_va, yrel_va, _yinit_va, yalign_va) = load_data_ridi_absheading(
+            ridi_root, device, window_size, stride,
+            return_ori=True,
+            return_rel_ori=True,
+            return_delta_p=True,
+            return_delta_p_world=True,
+            return_init=True,
+            align_init_quat=True,
+            align_init_quat_to_labels=False,
+            return_align=True,
+            acc_source="linacce",
+        )
+    elif dataset_name == "OXIOD":
+        # OXIOD 里 posenet 和 navigator 使用同一输入源。
+        (x_tr_pose, _ylen_tr_pose, yrel_tr_pose,
+         x_va_pose, _ylen_va_pose, yrel_va_pose) = load_data_oxiod_absheading(
+            oxiod_root, device, window_size, stride,
+            return_ori=False,
+            return_rel_ori=True,
+            return_delta_p=False,
+            return_init=False,
+        )
+        (x_tr, _ylen_tr, ydp_tr, ydpw_tr, yori_tr, yrel_tr, _yinit_tr, yalign_tr,
+         x_va, _ylen_va, ydp_va, ydpw_va, yori_va, yrel_va, _yinit_va, yalign_va) = load_data_oxiod_absheading(
+            oxiod_root, device, window_size, stride,
+            return_ori=True,
+            return_rel_ori=True,
+            return_delta_p=True,
+            return_delta_p_world=True,
+            return_init=True,
+            align_init_quat=True,
+            align_init_quat_to_labels=False,
+            return_align=True,
+        )
+    else:
+        raise ValueError(f"Unsupported DATASET={dataset_name}, expected RIDI or OXIOD")
     
-    # PoseNet 数据集
+    # posenet 数据集
     pose_dataset = TensorDataset(x_tr_pose, yrel_tr_pose)
     pose_loader = DataLoader(pose_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
     
-    # Navigator 数据集 (新增 yinit_tr)
+    # navigator 数据集
     nav_train_ds = TensorDataset(x_tr, ydp_tr, ydpw_tr, yori_tr, yrel_tr, yalign_tr)
     nav_val_ds = TensorDataset(x_va, ydp_va, ydpw_va, yori_va, yrel_va, yalign_va)
     
@@ -314,15 +336,15 @@ def main():
 
     # 2. 初始化模型
     in_ch = x_tr.shape[-1]
-    pose_net = PoseNetTransformer(imu_dim=6, d_model=128).to(device)
+    posenet = PoseNetTransformer(imu_dim=6, d_model=128).to(device)
     navigator = Navigator(imu_dim=in_ch, feat_dim=feat_dim).to(device)
 
-    # 3. 训练 PoseNet
-    train_pose_net(pose_net, pose_loader)
+    # 3. 训练 posenet
+    train_posenet(posenet, pose_loader)
 
-    # 4. 训练 Navigator (Stage 2: Frozen PoseNet)
-    train_navigator_corrected(
-        pose_net,
+    # 4. 训练 navigator（冻结 posenet）
+    train_navigator(
+        posenet,
         navigator,
         nav_train_loader,
         nav_val_loader,
@@ -332,10 +354,10 @@ def main():
         phase_name="Navigator-Stage2",
     )
 
-    # 5. 训练 Navigator + PoseNet (Stage 3: Joint Finetune)
+    # 5. 联合微调 navigator + posenet
     if joint_epochs > 0:
-        train_navigator_corrected(
-            pose_net,
+        train_navigator(
+            posenet,
             navigator,
             nav_train_loader,
             nav_val_loader,
