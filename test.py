@@ -1,4 +1,5 @@
 import os
+import json
 import numpy as np
 import torch
 
@@ -10,6 +11,8 @@ from data.dataset_OXIOD import (
 from data.dataset_RIDI import load_ridi_raw, window_dataset as ridi_window
 from models.posenet import PoseNetTransformer, quat_to_rotmat
 from models.navigator import Navigator
+from models.sequence_refiner import SequenceRefiner
+from utils.checkpoint_utils import build_model_from_checkpoint, checkpoint_value, load_checkpoint
 from utils.visualization import (
     plot_cumulative_dp,
     plot_dp_body_series,
@@ -69,6 +72,7 @@ def compute_init_rot(ori, pos_xyz, window_size, stride):
 def predict_navigator_batches(
     posenet,
     navigator,
+    refiner,
     gx_pose,
     ax_pose,
     gx_nav,
@@ -87,49 +91,77 @@ def predict_navigator_batches(
     if not use_gt_pose:
         posenet.eval()
     navigator.eval()
+    if refiner is not None:
+        refiner.eval()
     with torch.no_grad():
-        for start in range(0, n, batch_size):
-            end = min(start + batch_size, n)
-            xb_pose = torch.tensor(
-                np.concatenate([gx_pose[start:end], ax_pose[start:end]], axis=-1),
-                dtype=torch.float32,
-                device=device,
+        x_pose = torch.tensor(np.concatenate([gx_pose, ax_pose], axis=-1), dtype=torch.float32, device=device)
+        x_nav = torch.tensor(np.concatenate([gx_nav, ax_nav], axis=-1), dtype=torch.float32, device=device)
+        if use_gt_pose:
+            if yori is None or yrel is None:
+                raise ValueError("use_gt_pose=True requires yori and yrel.")
+            yb_ori = torch.tensor(yori, dtype=torch.float32, device=device)
+            yb_rel = torch.tensor(yrel, dtype=torch.float32, device=device)
+            q_rel = yb_rel
+        else:
+            q_rel = posenet(x_pose)
+        pred_dp_body = navigator(x_nav)
+
+        if refiner is not None:
+            pose_feat = posenet.encode_features(x_pose)
+            nav_feat = navigator.encode_features(x_nav)
+            q_gt = torch.tensor(yrel, dtype=torch.float32, device=device)
+            q_gt = q_gt / (q_gt.norm(dim=1, keepdim=True) + 1e-8)
+            q_pred = q_rel / (q_rel.norm(dim=1, keepdim=True) + 1e-8)
+            quat_dot = torch.sum(q_pred * q_gt, dim=1, keepdim=True)
+            quat_dot = torch.where(quat_dot < 0, -quat_dot, quat_dot)
+            tokens = torch.cat(
+                [
+                    pose_feat,
+                    nav_feat,
+                    pred_dp_body,
+                    q_rel,
+                    torch.linalg.norm(pred_dp_body[:, :2], dim=1, keepdim=True),
+                    quat_dot,
+                ],
+                dim=1,
             )
-            xb_nav = torch.tensor(
-                np.concatenate([gx_nav[start:end], ax_nav[start:end]], axis=-1),
-                dtype=torch.float32,
-                device=device,
-            )
-            if use_gt_pose:
-                if yori is None:
-                    raise ValueError("use_gt_pose=True requires yori.")
-                if yrel is None:
-                    raise ValueError("use_gt_pose=True requires yrel.")
-                yb_ori = torch.tensor(yori[start:end], dtype=torch.float32, device=device)
-                yb_rel = torch.tensor(yrel[start:end], dtype=torch.float32, device=device)
-                R_end = quat_to_rotmat(yb_ori)
-                R_rel = quat_to_rotmat(yb_rel)
-                R_start = torch.matmul(R_end, R_rel.transpose(1, 2))
-                R_use = R_start
-            else:
-                q_rel = posenet(xb_pose)
-                R_delta = quat_to_rotmat(q_rel)
-                R_start_list = []
-                for i in range(R_delta.size(0)):
-                    R_start_i = current_R_end
-                    R_start_list.append(R_start_i)
-                    current_R_end = torch.matmul(current_R_end, R_delta[i])
-                R_use = torch.stack(R_start_list, dim=0)
+            body_residual, rot_residual = refiner(tokens)
+            pred_dp_body = pred_dp_body + body_residual
+            r_delta = torch.matmul(quat_to_rotmat(q_rel), so3_exp_torch(rot_residual))
+        else:
+            r_delta = quat_to_rotmat(q_rel)
+
+        for i in range(n):
+            R_start_i = current_R_end
             if R_align is not None:
-                R_use = torch.matmul(R_align[start:end], R_use)
-            pred_dp_body = navigator(xb_nav)
-            pred_dp = torch.matmul(R_use, pred_dp_body.unsqueeze(-1)).squeeze(-1)
-            preds_dp.append(pred_dp.cpu().numpy())
-            preds_dp_body.append(pred_dp_body.cpu().numpy())
+                R_start_i = torch.matmul(R_align[i], R_start_i)
+            dp_world = torch.matmul(R_start_i, pred_dp_body[i].unsqueeze(-1)).squeeze(-1)
+            preds_dp.append(dp_world.cpu().numpy()[None, :])
+            preds_dp_body.append(pred_dp_body[i].cpu().numpy()[None, :])
+            current_R_end = torch.matmul(current_R_end, r_delta[i])
 
     pred_dp = np.concatenate(preds_dp, axis=0)
     pred_dp_body = np.concatenate(preds_dp_body, axis=0)
     return pred_dp, pred_dp_body
+
+
+def so3_exp_torch(rotvec):
+    theta = torch.linalg.norm(rotvec, dim=-1, keepdim=True).clamp_min(1e-8)
+    axis = rotvec / theta
+    x, y, z = axis[..., 0:1], axis[..., 1:2], axis[..., 2:3]
+    zero = torch.zeros_like(x)
+    K = torch.cat(
+        [
+            torch.cat([zero, -z, y], dim=-1)[..., None, :],
+            torch.cat([z, zero, -x], dim=-1)[..., None, :],
+            torch.cat([-y, x, zero], dim=-1)[..., None, :],
+        ],
+        dim=-2,
+    )
+    eye = torch.eye(3, device=rotvec.device, dtype=rotvec.dtype).expand(rotvec.shape[:-1] + (3, 3))
+    sin_term = torch.sin(theta)[..., None]
+    cos_term = (1.0 - torch.cos(theta))[..., None]
+    return eye + sin_term * K + cos_term * (K @ K)
 
 
 def build_traj_from_delta_p(init_pos, dp):
@@ -139,23 +171,88 @@ def build_traj_from_delta_p(init_pos, dp):
     return traj
 
 
+def ate_rmse(pred, gt):
+    return float(np.sqrt(np.mean(np.linalg.norm(pred - gt, axis=1) ** 2)))
+
+
+def pde(pred, gt):
+    if len(gt) < 2:
+        return 0.0
+    path_len = float(np.sum(np.linalg.norm(gt[1:] - gt[:-1], axis=1)))
+    if path_len < 1e-8:
+        return 0.0
+    return float(np.linalg.norm(pred[-1] - gt[-1]) / path_len)
+
+
+def t_rte(pred, gt, ts, interval_s=60.0):
+    if len(ts) < 2:
+        return np.nan
+    errs = []
+    for i in range(len(ts)):
+        j = int(np.searchsorted(ts, ts[i] + interval_s))
+        if j >= len(ts):
+            break
+        errs.append(np.linalg.norm((pred[j] - pred[i]) - (gt[j] - gt[i])))
+    if not errs:
+        return np.nan
+    return float(np.sqrt(np.mean(np.asarray(errs) ** 2)))
+
+
+def d_rte(pred, gt, distance_m=1.0):
+    if len(gt) < 2:
+        return np.nan
+    errs = []
+    for i in range(len(gt)):
+        accum = 0.0
+        for j in range(i + 1, len(gt)):
+            accum += float(np.linalg.norm(gt[j] - gt[j - 1]))
+            if accum >= distance_m:
+                errs.append(np.linalg.norm((pred[j] - pred[i]) - (gt[j] - gt[i])))
+                break
+    if not errs:
+        return np.nan
+    return float(np.sqrt(np.mean(np.asarray(errs) ** 2)))
+
+
+def summarize_rows(rows):
+    out = {}
+    for key in ["ate", "t_rte", "d_rte", "pde", "final", "len_mae", "traj_rmse"]:
+        vals = np.asarray([row[key] for row in rows], dtype=np.float64)
+        vals = vals[np.isfinite(vals)]
+        out[key] = float(np.mean(vals))
+    return out
+
+
 def main():
     pose_ckpt = os.path.join(ckpt_dir, "posenet.pth")
     nav_ckpt = os.path.join(ckpt_dir, "navigator.pth")
+    refiner_ckpt = os.path.join(ckpt_dir, "sequence_refiner.pth")
 
-    navigator = Navigator(imu_dim=6, feat_dim=64).to(device)
+    pose_state = load_checkpoint(pose_ckpt, device)
+    nav_state = load_checkpoint(nav_ckpt, device)
+    test_window_size = checkpoint_value(nav_state, pose_state, "window_size", window_size)
+    test_stride = checkpoint_value(nav_state, pose_state, "stride", stride)
+    navigator, nav_cfg = build_model_from_checkpoint(Navigator, nav_state, device)
+    print(f"Loaded navigator config: {nav_cfg}")
+    refiner = None
 
     posenet = None
     if not use_gt_pose:
-        posenet = PoseNetTransformer(
-            imu_dim=6,
-            d_model=128,
-            nhead=4,
-            num_layers=2,
-            dim_feedforward=256,
+        posenet, pose_cfg = build_model_from_checkpoint(PoseNetTransformer, pose_state, device)
+        print(f"Loaded posenet config: {pose_cfg}")
+    if os.path.exists(refiner_ckpt):
+        refiner_data = load_checkpoint(refiner_ckpt, device)
+        refiner = SequenceRefiner(
+            input_dim=refiner_data["input_dim"],
+            d_model=refiner_data["config"]["d_model"],
+            nhead=refiner_data["config"]["nhead"],
+            num_layers=refiner_data["config"]["num_layers"],
+            dim_feedforward=refiner_data["config"]["dim_feedforward"],
+            max_body_residual=refiner_data["config"]["max_body_residual"],
+            max_rot_residual_deg=refiner_data["config"]["max_rot_residual_deg"],
         ).to(device)
-        posenet.load_state_dict(torch.load(pose_ckpt, map_location=device))
-    navigator.load_state_dict(torch.load(nav_ckpt, map_location=device))
+        refiner.load_state_dict(refiner_data["model_state_dict"])
+        print("Loaded sequence refiner.")
 
     if dataset_name == "RIDI":
         test_list = os.path.join(ridi_root, "data", "list_test_publish_v2.txt")
@@ -170,6 +267,7 @@ def main():
     else:
         raise ValueError(f"Unsupported DATASET={dataset_name}, expected RIDI or OXIOD")
 
+    metric_rows = []
     for spec in seq_specs:
         if spec[0] == "RIDI":
             _, name = spec
@@ -181,8 +279,8 @@ def main():
 
             [gx_nav, ax_nav], [dl, yori, _yrel, ydp, ydp_world], init_pos, init_head = ridi_window(
                 gyro_nav, acc_nav, pos_xyz, ori,
-                window_size=window_size,
-                stride=stride,
+                window_size=test_window_size,
+                stride=test_stride,
                 filter_window=0,
                 smooth_length=False,
                 return_ori=True,
@@ -192,8 +290,8 @@ def main():
             )
             [gx_pose, ax_pose], _labels_pose, _init_pos_pose, _init_head_pose = ridi_window(
                 gyro_pose, acc_pose, pos_xyz, ori,
-                window_size=window_size,
-                stride=stride,
+                window_size=test_window_size,
+                stride=test_stride,
                 filter_window=0,
                 smooth_length=False,
                 return_ori=False,
@@ -206,8 +304,8 @@ def main():
             gyro, acc, pos_xyz, ori = load_oxiod_raw(imu_file, gt_file)
             [gx_nav, ax_nav], [dl, yori, _yrel, ydp, ydp_world], init_pos, init_head = oxiod_window(
                 gyro, acc, pos_xyz, ori,
-                window_size=window_size,
-                stride=stride,
+                window_size=test_window_size,
+                stride=test_stride,
                 filter_window=0,
                 smooth_length=False,
                 return_ori=True,
@@ -217,8 +315,8 @@ def main():
             )
             [gx_pose, ax_pose], _labels_pose, _init_pos_pose, _init_head_pose = oxiod_window(
                 gyro, acc, pos_xyz, ori,
-                window_size=window_size,
-                stride=stride,
+                window_size=test_window_size,
+                stride=test_stride,
                 filter_window=0,
                 smooth_length=False,
                 return_ori=False,
@@ -232,7 +330,7 @@ def main():
         if use_gt_pose:
             init_rot = torch.eye(3, dtype=torch.float32, device=device)
         else:
-            init_rot_np = compute_init_rot(ori, pos_xyz, window_size, stride)
+            init_rot_np = compute_init_rot(ori, pos_xyz, test_window_size, test_stride)
             if init_rot_np.shape[0] == 0:
                 continue
             init_rot = torch.tensor(init_rot_np[0], dtype=torch.float32, device=device)
@@ -259,6 +357,7 @@ def main():
         pred_dp, pred_dp_body = predict_navigator_batches(
             posenet,
             navigator,
+            refiner,
             gx_pose,
             ax_pose,
             gx_nav,
@@ -273,6 +372,7 @@ def main():
 
         gt_traj = build_traj_from_delta_p(init_pos, ydp_world[:, :2])
         pred_traj = build_traj_from_delta_p(init_pos, pred_dp[:, :2])
+        ts = np.arange(m, dtype=np.float64) * 0.004938 * test_stride
 
         gt_len = np.linalg.norm(ydp_world[:, :2], axis=1)
         pred_len = np.linalg.norm(pred_dp[:, :2], axis=1)
@@ -280,9 +380,30 @@ def main():
 
         traj_err = np.linalg.norm(pred_traj - gt_traj, axis=1)
         traj_rmse = np.sqrt(np.mean(traj_err ** 2))
+        ate = ate_rmse(pred_traj, gt_traj)
+        trte = t_rte(pred_traj, gt_traj, ts, interval_s=60.0)
+        drte = d_rte(pred_traj, gt_traj, distance_m=1.0)
+        path_pde = pde(pred_traj, gt_traj)
+        final_err = float(np.linalg.norm(pred_traj[-1] - gt_traj[-1]))
 
-        print(f"[{name}] Len MAE: {len_mae:.4f} | Traj RMSE: {traj_rmse:.3f} m")
+        print(
+            f"[{name}] Len MAE: {len_mae:.4f} | Traj RMSE: {traj_rmse:.3f} m | "
+            f"ATE: {ate:.3f} m | T-RTE: {trte:.3f} m | D-RTE: {drte:.3f} m | "
+            f"PDE: {path_pde * 100:.2f}% | Final: {final_err:.3f} m"
+        )
         out_name = safe_basename(name)
+        metric_rows.append(
+            {
+                "name": name,
+                "len_mae": float(len_mae),
+                "traj_rmse": float(traj_rmse),
+                "ate": float(ate),
+                "t_rte": float(trte),
+                "d_rte": float(drte),
+                "pde": float(path_pde),
+                "final": float(final_err),
+            }
+        )
 
         plot_trajectory_comparison(
             gt_traj,
@@ -311,6 +432,19 @@ def main():
             vis_num,
             os.path.join(output_dir, f"{out_name}_dp_body.png"),
         )
+
+    summary = summarize_rows(metric_rows)
+    summary_path = os.path.join(output_dir, "test_metrics.json")
+    with open(summary_path, "w") as f:
+        json.dump({"rows": metric_rows, "summary": summary}, f, indent=2)
+    print("\nSummary")
+    print(
+        f"ATE={summary['ate']:.4f} m | T-RTE={summary['t_rte']:.4f} m | "
+        f"D-RTE={summary['d_rte']:.4f} m | PDE={summary['pde'] * 100:.2f}% | "
+        f"Final={summary['final']:.4f} m | Len MAE={summary['len_mae']:.4f} | "
+        f"Traj RMSE={summary['traj_rmse']:.4f} m"
+    )
+    print(f"Saved metrics to {summary_path}")
 
 
 if __name__ == "__main__":

@@ -75,8 +75,12 @@ class PoseNetTransformer(nn.Module):
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.fc = nn.Linear(d_model, 4)
 
-    def forward(self, imu_seq):
+    def encode_features(self, imu_seq):
         x = self.input_proj(imu_seq)
         x = self.pos_encoder(x)
         x = self.transformer(x)
-        return F.normalize(self.fc(x.mean(dim=1)), dim=1, eps=1e-8)
+        return x.mean(dim=1)
+
+    def forward(self, imu_seq):
+        feat = self.encode_features(imu_seq)
+        return F.normalize(self.fc(feat), dim=1, eps=1e-8)

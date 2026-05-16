@@ -92,5 +92,8 @@ class Navigator(nn.Module):
             nn.Linear(64, 3),
         )
 
+    def encode_features(self, imu_seq):
+        return self.extractor(imu_seq)
+
     def forward(self, imu_seq):
-        return self.head(self.extractor(imu_seq))
+        return self.head(self.encode_features(imu_seq))

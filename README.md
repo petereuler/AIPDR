@@ -23,6 +23,11 @@
 - `utils/visualization.py`
 - `src/pdr.py`
 
+归档实验脚本：
+
+- 根目录里不再保留历史实验入口
+- 旧的量化 / ECC / 在线基线等实验脚本统一移动到 `archive/root_experiments/`
+
 输出目录：
 
 - `checkpoints/<dataset>/`

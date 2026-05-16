@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -16,6 +17,7 @@ from data.dataset_OXIOD import (
     window_dataset as oxiod_window,
 )
 from models.posenet import PoseNetTransformer, quat_to_rotmat
+from utils.checkpoint_utils import build_model_from_checkpoint, checkpoint_value, load_checkpoint
 from utils.visualization import (
     plot_absolute_euler,
     plot_heading_analysis,
@@ -25,6 +27,8 @@ from utils.visualization import (
 
 # 可选: "RIDI" / "OXIOD"
 DATASET = "RIDI"
+WINDOW_SIZE = 20
+STRIDE = 20
 
 # ======= 基础工具函数 =======
 
@@ -59,8 +63,8 @@ def reconstruct_from_absolute_angles(init_pos, step_lengths, absolute_angles):
     curr_pos = init_pos.copy()
     n = min(len(step_lengths), len(absolute_angles))
     for i in range(n):
-        step_len = step_lengths[i]
-        theta = absolute_angles[i]
+        step_len = float(np.asarray(step_lengths[i], dtype=np.float32).reshape(-1)[0])
+        theta = float(np.asarray(absolute_angles[i], dtype=np.float32).reshape(-1)[0])
         dx = step_len * np.cos(theta)
         dy = step_len * np.sin(theta)
         curr_pos[0] += dx
@@ -161,6 +165,67 @@ def load_oxiod_sequence(imu_file: str, gt_file: str, window_size: int, stride: i
     ori_seq = ori[b_indices[:min_len]]
     return x, y_rel, heading_motion, dl, init_pos, ori_seq
 
+
+def angle_wrap(rad):
+    return (rad + np.pi) % (2 * np.pi) - np.pi
+
+
+def angle_rmse_deg(pred_yaw, gt_yaw):
+    err = angle_wrap(np.asarray(pred_yaw) - np.asarray(gt_yaw))
+    return float(np.rad2deg(np.sqrt(np.mean(err ** 2))))
+
+
+def ate_rmse(pred, gt):
+    return float(np.sqrt(np.mean(np.linalg.norm(pred - gt, axis=1) ** 2)))
+
+
+def pde(pred, gt):
+    if len(gt) < 2:
+        return 0.0
+    path_len = float(np.sum(np.linalg.norm(gt[1:] - gt[:-1], axis=1)))
+    if path_len < 1e-8:
+        return 0.0
+    return float(np.linalg.norm(pred[-1] - gt[-1]) / path_len)
+
+
+def t_rte(pred, gt, ts, interval_s=60.0):
+    if len(ts) < 2:
+        return np.nan
+    errs = []
+    for i in range(len(ts)):
+        j = int(np.searchsorted(ts, ts[i] + interval_s))
+        if j >= len(ts):
+            break
+        errs.append(np.linalg.norm((pred[j] - pred[i]) - (gt[j] - gt[i])))
+    if not errs:
+        return np.nan
+    return float(np.sqrt(np.mean(np.asarray(errs) ** 2)))
+
+
+def d_rte(pred, gt, distance_m=1.0):
+    if len(gt) < 2:
+        return np.nan
+    errs = []
+    for i in range(len(gt)):
+        accum = 0.0
+        for j in range(i + 1, len(gt)):
+            accum += float(np.linalg.norm(gt[j] - gt[j - 1]))
+            if accum >= distance_m:
+                errs.append(np.linalg.norm((pred[j] - pred[i]) - (gt[j] - gt[i])))
+                break
+    if not errs:
+        return np.nan
+    return float(np.sqrt(np.mean(np.asarray(errs) ** 2)))
+
+
+def summarize_rows(rows):
+    out = {}
+    for key in ["yaw_rmse_deg", "ate", "t_rte", "d_rte", "pde", "final"]:
+        vals = np.asarray([row[key] for row in rows], dtype=np.float64)
+        vals = vals[np.isfinite(vals)]
+        out[key] = float(np.mean(vals))
+    return out
+
 # ======= 主流程 =======
 
 def main():
@@ -173,29 +238,16 @@ def main():
     out_dir = os.path.join(project_dir, "output", "posenet", dataset_name.lower())
     os.makedirs(out_dir, exist_ok=True)
     
-    # 这些参数需要和训练脚本保持一致。
-    WINDOW_SIZE = 64
-    STRIDE = 64
-    
+    ckpt_payload = load_checkpoint(ckpt_path, torch.device("cpu"))
+    window_size = checkpoint_value(ckpt_payload, None, "window_size", WINDOW_SIZE)
+    stride = checkpoint_value(ckpt_payload, None, "stride", STRIDE)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
     # 1. 加载 posenet
     print("Loading posenet...")
-    if os.path.exists(ckpt_path):
-        state = torch.load(ckpt_path, map_location=device)
-        posenet = PoseNetTransformer(
-            imu_dim=6,
-            d_model=128,
-        ).to(device)
-        posenet.load_state_dict(state)
-        print("Checkpoint loaded.")
-    else:
-        posenet = PoseNetTransformer(
-            imu_dim=6,
-            d_model=128,
-        ).to(device)
-        print("Checkpoint loaded.")
+    posenet, pose_cfg = build_model_from_checkpoint(PoseNetTransformer, load_checkpoint(ckpt_path, device), device)
+    print(f"Checkpoint loaded. Config: {pose_cfg}, window={window_size}, stride={stride}")
     posenet.eval()
 
     # 2. 获取测试列表
@@ -216,15 +268,16 @@ def main():
     
     # 统计数据
     global_z_stats = []
+    metric_rows = []
     
     # 3. 循环处理所有序列
     for spec in tqdm(seq_specs, desc="Processing"):
         if spec[0] == "RIDI":
             seq_name = spec[1]
-            data = load_ridi_sequence(ridi_root, seq_name, window_size=WINDOW_SIZE, stride=STRIDE)
+            data = load_ridi_sequence(ridi_root, seq_name, window_size=window_size, stride=stride)
         else:
             seq_name, imu_file, gt_file = spec[1], spec[2], spec[3]
-            data = load_oxiod_sequence(imu_file, gt_file, window_size=WINDOW_SIZE, stride=STRIDE)
+            data = load_oxiod_sequence(imu_file, gt_file, window_size=window_size, stride=stride)
         if data is None:
             continue
             
@@ -262,6 +315,7 @@ def main():
         yaw_phone_pred_raw = rotmat_to_euler_xyz(R_abs_tensor)[:, 2].cpu().numpy()
         yaw_phone_gt_raw = yaw_from_quat(ori_gt_seq).flatten()
         heading_motion_gt_raw = heading_motion_gt.flatten()
+        ts = np.arange(len(dl), dtype=np.float64) * 0.004938 * stride
 
         # 轨迹图里先做一个常数航向对齐，避免固定偏置主导可视化效果。
         yaw_pred_for_traj = align_yaw_to_motion(yaw_phone_pred_raw, heading_motion_gt_raw)
@@ -271,6 +325,30 @@ def main():
         
         # 生成四张诊断图。
         safe_seq_name = seq_name.replace("/", "_").replace("\\", "_")
+        traj_pred = reconstruct_from_absolute_angles(init_pos.copy(), dl.flatten(), yaw_pred_for_traj)
+        traj_gt = reconstruct_from_absolute_angles(init_pos.copy(), dl.flatten(), heading_motion_gt_raw)
+        yaw_rmse = angle_rmse_deg(yaw_phone_pred_raw, yaw_phone_gt_raw)
+        ate = ate_rmse(traj_pred[1:], traj_gt[1:])
+        trte = t_rte(traj_pred[1:], traj_gt[1:], ts, interval_s=60.0)
+        drte = d_rte(traj_pred[1:], traj_gt[1:], distance_m=1.0)
+        path_pde = pde(traj_pred[1:], traj_gt[1:])
+        final_err = float(np.linalg.norm(traj_pred[-1] - traj_gt[-1]))
+        metric_rows.append(
+            {
+                "name": seq_name,
+                "yaw_rmse_deg": yaw_rmse,
+                "ate": ate,
+                "t_rte": trte,
+                "d_rte": drte,
+                "pde": path_pde,
+                "final": final_err,
+            }
+        )
+        print(
+            f"[{seq_name}] Yaw RMSE: {yaw_rmse:.3f} deg | "
+            f"ATE: {ate:.3f} m | T-RTE: {trte:.3f} m | D-RTE: {drte:.3f} m | "
+            f"PDE: {path_pde * 100:.2f}% | Final: {final_err:.3f} m"
+        )
         plot_relative_euler(R_pred_rel, R_gt_rel, out_dir, safe_seq_name, rotmat_to_euler_xyz)
         plot_posenet_trajectory_comparison(
             init_pos, dl, yaw_pred_for_traj, heading_motion_gt_raw, out_dir, safe_seq_name, reconstruct_from_absolute_angles
@@ -283,6 +361,16 @@ def main():
     print("ANALYSIS COMPLETE")
     print(f"Output Directory: {out_dir}")
     print(f"Average Gravity Z Std: {np.mean(global_z_stats):.4f}")
+    summary = summarize_rows(metric_rows)
+    metrics_path = os.path.join(out_dir, "posenet_test_metrics.json")
+    with open(metrics_path, "w") as f:
+        json.dump({"rows": metric_rows, "summary": summary}, f, indent=2)
+    print(
+        f"Yaw RMSE={summary['yaw_rmse_deg']:.4f} deg | ATE={summary['ate']:.4f} m | "
+        f"T-RTE={summary['t_rte']:.4f} m | D-RTE={summary['d_rte']:.4f} m | "
+        f"PDE={summary['pde'] * 100:.2f}% | Final={summary['final']:.4f} m"
+    )
+    print(f"Saved metrics to {metrics_path}")
     print("="*50)
 
 if __name__ == "__main__":
