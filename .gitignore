@@ -16,10 +16,22 @@
 # Allow core python files
 !posenet_test.py
 !train.py
+!train_pose_truth_autoencoder.py
+!train_disp_truth_autoencoder.py
+!train_imu_pose_latent.py
+!train_truth_autoencoder.py
 !test.py
+!test_pose_truth_autoencoder.py
+!test_disp_truth_autoencoder.py
+!test_imu_pose_latent.py
+!test_truth_autoencoder.py
 
 # Allow gitignore itself
 !.gitignore
 
 # Allow README.md
 !README.md
+
+# Ignore generated Python caches
+**/__pycache__/
+**/*.pyc

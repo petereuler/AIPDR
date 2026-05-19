@@ -9,9 +9,9 @@ from data.dataset_OXIOD import (
     window_dataset as oxiod_window,
 )
 from data.dataset_RIDI import load_ridi_raw, window_dataset as ridi_window
+from models.encoder_transformer_reasoner import EncoderTransformerReasoner
 from models.posenet import PoseNetTransformer, quat_to_rotmat
 from models.navigator import Navigator
-from models.sequence_refiner import SequenceRefiner
 from utils.checkpoint_utils import build_model_from_checkpoint, checkpoint_value, load_checkpoint
 from utils.visualization import (
     plot_cumulative_dp,
@@ -72,7 +72,7 @@ def compute_init_rot(ori, pos_xyz, window_size, stride):
 def predict_navigator_batches(
     posenet,
     navigator,
-    refiner,
+    reasoner,
     gx_pose,
     ax_pose,
     gx_nav,
@@ -91,8 +91,8 @@ def predict_navigator_batches(
     if not use_gt_pose:
         posenet.eval()
     navigator.eval()
-    if refiner is not None:
-        refiner.eval()
+    if reasoner is not None:
+        reasoner.eval()
     with torch.no_grad():
         x_pose = torch.tensor(np.concatenate([gx_pose, ax_pose], axis=-1), dtype=torch.float32, device=device)
         x_nav = torch.tensor(np.concatenate([gx_nav, ax_nav], axis=-1), dtype=torch.float32, device=device)
@@ -106,30 +106,11 @@ def predict_navigator_batches(
             q_rel = posenet(x_pose)
         pred_dp_body = navigator(x_nav)
 
-        if refiner is not None:
+        if reasoner is not None:
             pose_feat = posenet.encode_features(x_pose)
             nav_feat = navigator.encode_features(x_nav)
-            q_gt = torch.tensor(yrel, dtype=torch.float32, device=device)
-            q_gt = q_gt / (q_gt.norm(dim=1, keepdim=True) + 1e-8)
-            q_pred = q_rel / (q_rel.norm(dim=1, keepdim=True) + 1e-8)
-            quat_dot = torch.sum(q_pred * q_gt, dim=1, keepdim=True)
-            quat_dot = torch.where(quat_dot < 0, -quat_dot, quat_dot)
-            tokens = torch.cat(
-                [
-                    pose_feat,
-                    nav_feat,
-                    pred_dp_body,
-                    q_rel,
-                    torch.linalg.norm(pred_dp_body[:, :2], dim=1, keepdim=True),
-                    quat_dot,
-                ],
-                dim=1,
-            )
-            body_residual, rot_residual = refiner(tokens)
-            pred_dp_body = pred_dp_body + body_residual
-            r_delta = torch.matmul(quat_to_rotmat(q_rel), so3_exp_torch(rot_residual))
-        else:
-            r_delta = quat_to_rotmat(q_rel)
+            q_rel, pred_dp_body = reasoner(pose_feat, nav_feat, base_q_rel=q_rel, base_dp_body=pred_dp_body)
+        r_delta = quat_to_rotmat(q_rel)
 
         for i in range(n):
             R_start_i = current_R_end
@@ -143,26 +124,6 @@ def predict_navigator_batches(
     pred_dp = np.concatenate(preds_dp, axis=0)
     pred_dp_body = np.concatenate(preds_dp_body, axis=0)
     return pred_dp, pred_dp_body
-
-
-def so3_exp_torch(rotvec):
-    theta = torch.linalg.norm(rotvec, dim=-1, keepdim=True).clamp_min(1e-8)
-    axis = rotvec / theta
-    x, y, z = axis[..., 0:1], axis[..., 1:2], axis[..., 2:3]
-    zero = torch.zeros_like(x)
-    K = torch.cat(
-        [
-            torch.cat([zero, -z, y], dim=-1)[..., None, :],
-            torch.cat([z, zero, -x], dim=-1)[..., None, :],
-            torch.cat([-y, x, zero], dim=-1)[..., None, :],
-        ],
-        dim=-2,
-    )
-    eye = torch.eye(3, device=rotvec.device, dtype=rotvec.dtype).expand(rotvec.shape[:-1] + (3, 3))
-    sin_term = torch.sin(theta)[..., None]
-    cos_term = (1.0 - torch.cos(theta))[..., None]
-    return eye + sin_term * K + cos_term * (K @ K)
-
 
 def build_traj_from_delta_p(init_pos, dp):
     traj = np.zeros((dp.shape[0], 2), dtype=np.float32)
@@ -226,7 +187,7 @@ def summarize_rows(rows):
 def main():
     pose_ckpt = os.path.join(ckpt_dir, "posenet.pth")
     nav_ckpt = os.path.join(ckpt_dir, "navigator.pth")
-    refiner_ckpt = os.path.join(ckpt_dir, "sequence_refiner.pth")
+    reasoner_ckpt = os.path.join(ckpt_dir, "encoder_transformer_reasoner.pth")
 
     pose_state = load_checkpoint(pose_ckpt, device)
     nav_state = load_checkpoint(nav_ckpt, device)
@@ -234,25 +195,16 @@ def main():
     test_stride = checkpoint_value(nav_state, pose_state, "stride", stride)
     navigator, nav_cfg = build_model_from_checkpoint(Navigator, nav_state, device)
     print(f"Loaded navigator config: {nav_cfg}")
-    refiner = None
+    reasoner = None
 
     posenet = None
     if not use_gt_pose:
         posenet, pose_cfg = build_model_from_checkpoint(PoseNetTransformer, pose_state, device)
         print(f"Loaded posenet config: {pose_cfg}")
-    if os.path.exists(refiner_ckpt):
-        refiner_data = load_checkpoint(refiner_ckpt, device)
-        refiner = SequenceRefiner(
-            input_dim=refiner_data["input_dim"],
-            d_model=refiner_data["config"]["d_model"],
-            nhead=refiner_data["config"]["nhead"],
-            num_layers=refiner_data["config"]["num_layers"],
-            dim_feedforward=refiner_data["config"]["dim_feedforward"],
-            max_body_residual=refiner_data["config"]["max_body_residual"],
-            max_rot_residual_deg=refiner_data["config"]["max_rot_residual_deg"],
-        ).to(device)
-        refiner.load_state_dict(refiner_data["model_state_dict"])
-        print("Loaded sequence refiner.")
+    if os.path.exists(reasoner_ckpt):
+        reasoner_data = load_checkpoint(reasoner_ckpt, device)
+        reasoner, reasoner_cfg = build_model_from_checkpoint(EncoderTransformerReasoner, reasoner_data, device)
+        print(f"Loaded encoder transformer reasoner: {reasoner_cfg}")
 
     if dataset_name == "RIDI":
         test_list = os.path.join(ridi_root, "data", "list_test_publish_v2.txt")
@@ -357,7 +309,7 @@ def main():
         pred_dp, pred_dp_body = predict_navigator_batches(
             posenet,
             navigator,
-            refiner,
+            reasoner,
             gx_pose,
             ax_pose,
             gx_nav,

@@ -82,6 +82,7 @@ def window_dataset(
     ori_data,
     window_size=160,
     stride=36,
+    start_offset=0,
     filter_window=0,
     smooth_length=False,
     length_sigma=1.0,
@@ -111,7 +112,8 @@ def window_dataset(
     init_head = 0.0
 
     max_start = gyro_data.shape[0] - window_size - 1
-    for idx in range(0, max_start, stride):
+    start_offset = int(max(0, start_offset))
+    for idx in range(start_offset, max_start, stride):
         imu_gyro.append(gyro_data[idx + 1 : idx + 1 + window_size, :])
         imu_acc.append(acc_data[idx + 1 : idx + 1 + window_size, :])
 

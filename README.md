@@ -5,6 +5,7 @@
 - `train.py`：训练 `posenet` 和 `navigator`
 - `test.py`：测试 `posenet + navigator`
 - `posenet_test.py`：单独测试 `posenet`
+- `test_truth_autoencoder.py`：测试真值重建网络
 
 数据目录 `RIDI/`、`OXIOD/`、`RONIN/`、`SELFMADE/` 仍保留，但当前主链只直接使用 `RIDI/` 和 `OXIOD/`。
 
@@ -15,10 +16,19 @@
 - `train.py`
 - `test.py`
 - `posenet_test.py`
+- `train_truth_autoencoder.py`
+- `train_pose_truth_autoencoder.py`
+- `train_disp_truth_autoencoder.py`
+- `train_imu_pose_latent.py`
 - `models/posenet.py`
 - `models/navigator.py`
+- `models/truth_autoencoder.py`
+- `models/pose_truth_autoencoder.py`
+- `models/imu_to_pose_latent.py`
 - `data/dataset_RIDI.py`
 - `data/dataset_OXIOD.py`
+- `data/dense_truth.py`
+- `data/relative_window_truth.py`
 - `utils/training_utils.py`
 - `utils/visualization.py`
 - `src/pdr.py`
@@ -109,7 +119,30 @@
   - `load_data_ridi_absheading(...)`
   - `load_data_oxiod_absheading(...)`
 
-### 4. 可视化层
+`data/dense_truth.py`
+
+作用：
+
+- 从窗口内提取 dense 真值序列
+- 生成窗口级相对位置重建数据
+
+### 4. 真值重建网络
+
+`models/truth_autoencoder.py`
+
+作用：
+
+- 输入窗口内 dense 真值序列
+- 压缩到 latent
+- 再重建回同分辨率的窗口真值
+
+训练入口：
+
+- `train_truth_autoencoder.py`
+- `train_pose_truth_autoencoder.py`
+- `train_disp_truth_autoencoder.py`
+
+### 5. 可视化层
 
 `utils/visualization.py`
 
@@ -124,7 +157,7 @@
 
 共同使用
 
-### 5. PDR
+### 6. PDR
 
 `src/pdr.py`
 
@@ -218,6 +251,66 @@ python train.py
 DATASET=OXIOD python train.py
 ```
 
+训练真值重建网络：
+
+```bash
+python train_truth_autoencoder.py
+```
+
+训练 OXIOD 的真值重建网络：
+
+```bash
+DATASET=OXIOD python train_truth_autoencoder.py
+```
+
+可切换真值类型：
+
+```bash
+TRUTH_MODE=step_pos_body python train_truth_autoencoder.py
+```
+
+测试真值重建网络：
+
+```bash
+python test_truth_autoencoder.py
+```
+
+训练相对姿态真值重建网络：
+
+```bash
+python train_pose_truth_autoencoder.py
+```
+
+测试相对姿态真值重建网络：
+
+```bash
+python test_pose_truth_autoencoder.py
+```
+
+训练 IMU 到姿态 latent 的预测网络：
+
+```bash
+python train_imu_pose_latent.py
+```
+
+测试 IMU 到姿态 latent 的预测网络：
+
+```bash
+python test_imu_pose_latent.py
+```
+
+训练相对位移真值重建网络：
+
+```bash
+python train_disp_truth_autoencoder.py
+```
+
+测试相对位移真值重建网络：
+
+```bash
+python test_disp_truth_autoencoder.py
+```
+
 ## 依赖
 
 当前主链至少依赖：
@@ -246,3 +339,6 @@ DATASET=OXIOD python train.py
 3. 运行 `python posenet_test.py`
 4. 运行 `python test.py`
 5. 需要基线对比时，再接入 `src/pdr.py`
+
+
+轨迹误差大那都是小问题，我已经看到我们truth embedding思路对之前那几个突变做好的优化了，说明这条路径的上限绝对比当前train.py/test.py高。你继续进行优化吧，整窗姿态不能直接一股脑的用，而是应该找到合适的机制把解码出的整窗姿态做一个窗级可信平滑滤波。
