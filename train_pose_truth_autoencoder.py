@@ -8,7 +8,7 @@ import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
-from data.relative_window_truth import load_relative_truth_datasets
+from data.relative_window_truth import load_pose_imu_relative_datasets
 from models.pose_truth_autoencoder import (
     PoseTruthAutoEncoder,
     quaternion_endpoint_error_rad,
@@ -30,6 +30,7 @@ NHEAD = 4
 NUM_LAYERS = 2
 DIM_FEEDFORWARD = 256
 DROPOUT = 0.1
+IMU_CONDITION_MODE = "both"  # "none" | "encoder" | "decoder" | "both"
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 RIDI_ROOT = os.path.join(PROJECT_DIR, "RIDI")
@@ -42,6 +43,7 @@ batch_size = int(os.getenv("BATCH_SIZE", BATCH_SIZE))
 epochs = int(os.getenv("EPOCHS", EPOCHS))
 latent_dim = int(os.getenv("LATENT_DIM", LATENT_DIM))
 mode = os.getenv("MODE", "resume").lower()
+imu_condition_mode = os.getenv("IMU_CONDITION_MODE", IMU_CONDITION_MODE).lower()
 
 ckpt_dir = os.path.join(PROJECT_DIR, "checkpoints", dataset_name.lower())
 output_dir = os.path.join(PROJECT_DIR, "output", "pose_truth_autoencoder", dataset_name.lower())
@@ -70,12 +72,20 @@ def default_model_config():
         "num_layers": NUM_LAYERS,
         "dim_feedforward": DIM_FEEDFORWARD,
         "dropout": DROPOUT,
+        "condition_mode": imu_condition_mode,
+        "imu_dim": 6,
     }
 
 
-def make_loader(x, shuffle):
-    tensor = torch.tensor(x, dtype=torch.float32)
-    return DataLoader(TensorDataset(tensor), batch_size=batch_size, shuffle=shuffle)
+def make_loader(x_truth, x_imu, shuffle):
+    return DataLoader(
+        TensorDataset(
+            torch.tensor(x_truth, dtype=torch.float32),
+            torch.tensor(x_imu, dtype=torch.float32),
+        ),
+        batch_size=batch_size,
+        shuffle=shuffle,
+    )
 
 
 def quat_to_yaw_np(q):
@@ -94,9 +104,10 @@ def evaluate(model, loader):
     yaw_rmse_rows = []
     end_err_rows = []
     with torch.no_grad():
-        for (xb,) in loader:
+        for xb, ib in loader:
             xb = xb.to(device)
-            recon, latent = model(xb)
+            ib = ib.to(device)
+            recon, latent = model(xb, imu_seq=ib)
             loss_recon = quaternion_sequence_loss(recon, xb)
             end_err = quaternion_endpoint_error_rad(recon, xb)
             loss_rows.append(float(loss_recon.item()) * xb.size(0))
@@ -116,14 +127,15 @@ def evaluate(model, loader):
     }
 
 
-def plot_pose_examples(model, x_val, out_dir, max_examples=6):
+def plot_pose_examples(model, x_val, imu_val, out_dir, max_examples=6):
     if x_val.shape[0] == 0:
         return
     count = min(max_examples, x_val.shape[0])
     idx = np.linspace(0, x_val.shape[0] - 1, count, dtype=np.int64)
     xb = torch.tensor(x_val[idx], dtype=torch.float32, device=device)
+    ib = torch.tensor(imu_val[idx], dtype=torch.float32, device=device)
     with torch.no_grad():
-        recon, _latent = model(xb)
+        recon, _latent = model(xb, imu_seq=ib)
     pred = recon.cpu().numpy()
     gt = xb.cpu().numpy()
     yaw_pred = quat_to_yaw_np(pred)
@@ -180,7 +192,7 @@ def main():
                 f"current=({window_size}, {stride})"
             )
 
-    datasets = load_relative_truth_datasets(
+    datasets = load_pose_imu_relative_datasets(
         dataset_name,
         RIDI_ROOT,
         OXIOD_ROOT,
@@ -190,16 +202,21 @@ def main():
     )
     x_train = datasets["pose_train"]
     x_val = datasets["pose_val"]
+    imu_train = datasets["imu_train"]
+    imu_val = datasets["imu_val"]
     if x_train.shape[0] == 0 or x_val.shape[0] == 0:
         raise RuntimeError(f"No pose truth windows found for DATASET={dataset_name}")
 
-    print(f"Pose truth windows: train={x_train.shape[0]} val={x_val.shape[0]} shape={x_train.shape[1:]}")
+    print(
+        f"Pose truth windows: train={x_train.shape[0]} val={x_val.shape[0]} "
+        f"shape={x_train.shape[1:]} imu_condition={imu_condition_mode}"
+    )
 
     model_cfg = default_model_config() if resume_state is None else resume_state["model_config"]
     model = PoseTruthAutoEncoder(**model_cfg).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    train_loader = make_loader(x_train, shuffle=True)
-    val_loader = make_loader(x_val, shuffle=False)
+    train_loader = make_loader(x_train, imu_train, shuffle=True)
+    val_loader = make_loader(x_val, imu_val, shuffle=False)
 
     start_epoch = 0
     best_loss = float("inf")
@@ -224,9 +241,10 @@ def main():
         model.train()
         total = 0.0
         count = 0
-        for (xb,) in train_loader:
+        for xb, ib in train_loader:
             xb = xb.to(device)
-            recon, latent = model(xb)
+            ib = ib.to(device)
+            recon, latent = model(xb, imu_seq=ib)
             loss_recon = quaternion_sequence_loss(recon, xb)
             loss_latent = 1e-4 * torch.mean(latent * latent)
             loss = loss_recon + loss_latent
@@ -268,7 +286,7 @@ def main():
     best_state = load_torch_checkpoint(ckpt_path, map_location=device)
     model.load_state_dict(best_state["model_state_dict"])
     final_metrics = evaluate(model, val_loader)
-    plot_pose_examples(model, x_val, output_dir)
+    plot_pose_examples(model, x_val, imu_val, output_dir)
 
     metrics_path = os.path.join(output_dir, "metrics.json")
     with open(metrics_path, "w") as f:

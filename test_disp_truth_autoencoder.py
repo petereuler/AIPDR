@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-from data.relative_window_truth import load_relative_truth_datasets
+from data.relative_window_truth import load_pose_imu_relative_datasets
 from models.truth_autoencoder import TruthAutoEncoder
 
 
@@ -45,9 +45,15 @@ def unnormalize_truth(x, mean, std):
     return x * std + mean
 
 
-def make_loader(x):
-    tensor = torch.tensor(x, dtype=torch.float32)
-    return DataLoader(TensorDataset(tensor), batch_size=batch_size, shuffle=False)
+def make_loader(x_truth, x_imu):
+    return DataLoader(
+        TensorDataset(
+            torch.tensor(x_truth, dtype=torch.float32),
+            torch.tensor(x_imu, dtype=torch.float32),
+        ),
+        batch_size=batch_size,
+        shuffle=False,
+    )
 
 
 def dense_rmse(pred, gt):
@@ -71,9 +77,10 @@ def run_inference(model, loader, mean_np, std_np):
     pred_rows = []
     gt_rows = []
     with torch.no_grad():
-        for (xb,) in loader:
+        for xb, ib in loader:
             xb = xb.to(device)
-            recon, latent = model(xb)
+            ib = ib.to(device)
+            recon, latent = model(xb, imu_seq=ib)
             loss = F.smooth_l1_loss(recon, xb)
             losses.append(float(loss.item()) * xb.size(0))
             pred_rows.append(unnormalize_truth(recon.cpu().numpy(), mean_np, std_np))
@@ -124,7 +131,7 @@ def main():
 
     mean_np = np.asarray(state["truth_mean"], dtype=np.float32).reshape(1, 1, -1)
     std_np = np.asarray(state["truth_std"], dtype=np.float32).reshape(1, 1, -1)
-    datasets = load_relative_truth_datasets(
+    datasets = load_pose_imu_relative_datasets(
         dataset_name,
         RIDI_ROOT,
         OXIOD_ROOT,
@@ -133,11 +140,12 @@ def main():
         start_offset=0,
     )
     x_val = datasets["disp_val"]
+    imu_val = datasets["imu_val"]
     if x_val.shape[0] == 0:
         raise RuntimeError(f"No displacement truth validation windows found for DATASET={dataset_name}")
 
     x_val_norm = normalize_truth(x_val, mean_np, std_np).astype(np.float32)
-    pred, gt, metrics = run_inference(model, make_loader(x_val_norm), mean_np, std_np)
+    pred, gt, metrics = run_inference(model, make_loader(x_val_norm, imu_val), mean_np, std_np)
     print(
         f"Val windows={x_val.shape[0]} loss={metrics['loss']:.6f} dense_rmse={metrics['dense_rmse']:.4f}m "
         f"endpoint_rmse={metrics['endpoint_rmse']:.4f}m path_len_mae={metrics['path_len_mae']:.4f}m"

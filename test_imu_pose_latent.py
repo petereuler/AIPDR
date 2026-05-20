@@ -85,7 +85,7 @@ def evaluate(predictor, autoencoder, loader):
             xb_imu = xb_imu.to(device)
             yb_pose = yb_pose.to(device)
             z_pred = predictor(xb_imu)
-            q_pred = autoencoder.decode(z_pred)
+            q_pred = autoencoder.decode(z_pred, imu_seq=xb_imu)
             loss_rows.append(float(quaternion_sequence_loss(q_pred, yb_pose).item()) * xb_imu.size(0))
             end_rows.append(float(quaternion_endpoint_error_rad(q_pred, yb_pose).item()) * xb_imu.size(0))
             pred_rows.append(q_pred.cpu().numpy())
@@ -107,7 +107,7 @@ def run_sequence(model, autoencoder, imu_seq):
     xb = torch.tensor(imu_seq, dtype=torch.float32, device=device)
     with torch.no_grad():
         z_pred = model(xb)
-        q_pred = autoencoder.decode(z_pred)
+        q_pred = autoencoder.decode(z_pred, imu_seq=xb)
     return q_pred.cpu().numpy()
 
 

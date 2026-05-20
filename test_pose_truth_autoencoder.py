@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from data.relative_window_truth import load_relative_truth_datasets
+from data.relative_window_truth import load_pose_imu_relative_datasets
 from models.pose_truth_autoencoder import (
     PoseTruthAutoEncoder,
     quaternion_endpoint_error_rad,
@@ -50,9 +50,15 @@ def angle_wrap(x):
     return (x + np.pi) % (2 * np.pi) - np.pi
 
 
-def make_loader(x):
-    tensor = torch.tensor(x, dtype=torch.float32)
-    return DataLoader(TensorDataset(tensor), batch_size=batch_size, shuffle=False)
+def make_loader(x_truth, x_imu):
+    return DataLoader(
+        TensorDataset(
+            torch.tensor(x_truth, dtype=torch.float32),
+            torch.tensor(x_imu, dtype=torch.float32),
+        ),
+        batch_size=batch_size,
+        shuffle=False,
+    )
 
 
 def evaluate(model, loader):
@@ -62,9 +68,10 @@ def evaluate(model, loader):
     loss_rows = []
     end_rows = []
     with torch.no_grad():
-        for (xb,) in loader:
+        for xb, ib in loader:
             xb = xb.to(device)
-            recon, latent = model(xb)
+            ib = ib.to(device)
+            recon, latent = model(xb, imu_seq=ib)
             loss_rows.append(float(quaternion_sequence_loss(recon, xb).item()) * xb.size(0))
             end_rows.append(float(quaternion_endpoint_error_rad(recon, xb).item()) * xb.size(0))
             pred_rows.append(recon.cpu().numpy())
@@ -83,10 +90,11 @@ def evaluate(model, loader):
     return pred, gt, metrics
 
 
-def run_model_numpy(model, x):
+def run_model_numpy(model, x, imu):
     xb = torch.tensor(x, dtype=torch.float32, device=device)
+    ib = torch.tensor(imu, dtype=torch.float32, device=device)
     with torch.no_grad():
-        recon, _latent = model(xb)
+        recon, _latent = model(xb, imu_seq=ib)
     return recon.cpu().numpy()
 
 
@@ -157,7 +165,7 @@ def main():
     model = PoseTruthAutoEncoder(**state["model_config"]).to(device)
     model.load_state_dict(state["model_state_dict"])
 
-    datasets = load_relative_truth_datasets(
+    datasets = load_pose_imu_relative_datasets(
         dataset_name,
         RIDI_ROOT,
         OXIOD_ROOT,
@@ -166,11 +174,12 @@ def main():
         start_offset=0,
     )
     x_val = datasets["pose_val"]
-    val_sequences = datasets["pose_val_sequences"]
+    imu_val = datasets["imu_val"]
+    val_sequences = datasets["val_sequences"]
     if x_val.shape[0] == 0:
         raise RuntimeError(f"No pose truth validation windows found for DATASET={dataset_name}")
 
-    pred, gt, metrics = evaluate(model, make_loader(x_val))
+    pred, gt, metrics = evaluate(model, make_loader(x_val, imu_val))
     print(
         f"Val windows={x_val.shape[0]} loss={metrics['loss']:.6f} "
         f"yaw_rmse={metrics['yaw_rmse_deg']:.3f}deg endpoint_angle={metrics['endpoint_angle_deg']:.3f}deg"
@@ -180,7 +189,7 @@ def main():
     for seq in val_sequences:
         seq_name = seq["name"]
         gt_seq = seq["truth"]
-        pred_seq = run_model_numpy(model, gt_seq)
+        pred_seq = run_model_numpy(model, gt_seq, seq["imu"])
         row = {"name": seq_name, **sequence_metrics(pred_seq, gt_seq)}
         sequence_rows.append(row)
         print(

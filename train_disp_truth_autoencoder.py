@@ -9,7 +9,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
-from data.relative_window_truth import load_relative_truth_datasets
+from data.relative_window_truth import load_pose_imu_relative_datasets
 from models.truth_autoencoder import TruthAutoEncoder
 
 
@@ -27,6 +27,7 @@ NHEAD = 4
 NUM_LAYERS = 2
 DIM_FEEDFORWARD = 256
 DROPOUT = 0.1
+IMU_CONDITION_MODE = "both"  # "none" | "encoder" | "decoder" | "both"
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 RIDI_ROOT = os.path.join(PROJECT_DIR, "RIDI")
@@ -39,6 +40,7 @@ batch_size = int(os.getenv("BATCH_SIZE", BATCH_SIZE))
 epochs = int(os.getenv("EPOCHS", EPOCHS))
 latent_dim = int(os.getenv("LATENT_DIM", LATENT_DIM))
 mode = os.getenv("MODE", "train").lower()
+imu_condition_mode = os.getenv("IMU_CONDITION_MODE", IMU_CONDITION_MODE).lower()
 
 ckpt_dir = os.path.join(PROJECT_DIR, "checkpoints", dataset_name.lower())
 output_dir = os.path.join(PROJECT_DIR, "output", "disp_truth_autoencoder", dataset_name.lower())
@@ -63,6 +65,8 @@ def model_config():
         "num_layers": NUM_LAYERS,
         "dim_feedforward": DIM_FEEDFORWARD,
         "dropout": DROPOUT,
+        "condition_mode": imu_condition_mode,
+        "imu_dim": 6,
     }
 
 
@@ -81,9 +85,15 @@ def unnormalize_truth(x, mean, std):
     return x * std + mean
 
 
-def make_loader(x, shuffle):
-    tensor = torch.tensor(x, dtype=torch.float32)
-    return DataLoader(TensorDataset(tensor), batch_size=batch_size, shuffle=shuffle)
+def make_loader(x_truth, x_imu, shuffle):
+    return DataLoader(
+        TensorDataset(
+            torch.tensor(x_truth, dtype=torch.float32),
+            torch.tensor(x_imu, dtype=torch.float32),
+        ),
+        batch_size=batch_size,
+        shuffle=shuffle,
+    )
 
 
 def dense_rmse(pred, gt):
@@ -107,9 +117,10 @@ def evaluate(model, loader, mean_np, std_np):
     pred_rows = []
     gt_rows = []
     with torch.no_grad():
-        for (xb,) in loader:
+        for xb, ib in loader:
             xb = xb.to(device)
-            recon, _latent = model(xb)
+            ib = ib.to(device)
+            recon, _latent = model(xb, imu_seq=ib)
             loss = F.smooth_l1_loss(recon, xb)
             losses.append(float(loss.item()) * xb.size(0))
             pred_rows.append(unnormalize_truth(recon.cpu().numpy(), mean_np, std_np))
@@ -124,14 +135,15 @@ def evaluate(model, loader, mean_np, std_np):
     }
 
 
-def plot_examples(model, x_val_norm, mean_np, std_np, out_dir, max_examples=6):
+def plot_examples(model, x_val_norm, imu_val, mean_np, std_np, out_dir, max_examples=6):
     if x_val_norm.shape[0] == 0:
         return
     count = min(max_examples, x_val_norm.shape[0])
     idx = np.linspace(0, x_val_norm.shape[0] - 1, count, dtype=np.int64)
     xb = torch.tensor(x_val_norm[idx], dtype=torch.float32, device=device)
+    ib = torch.tensor(imu_val[idx], dtype=torch.float32, device=device)
     with torch.no_grad():
-        recon, _latent = model(xb)
+        recon, _latent = model(xb, imu_seq=ib)
     pred = unnormalize_truth(recon.cpu().numpy(), mean_np, std_np)
     gt = unnormalize_truth(xb.cpu().numpy(), mean_np, std_np)
     fig, axes = plt.subplots(2, 3, figsize=(12, 8), dpi=150)
@@ -171,7 +183,7 @@ def save_checkpoint(path, model, mean_np, std_np, val_metrics):
 
 def main():
     ckpt_path = os.path.join(ckpt_dir, "disp_truth_autoencoder.pth")
-    datasets = load_relative_truth_datasets(
+    datasets = load_pose_imu_relative_datasets(
         dataset_name,
         RIDI_ROOT,
         OXIOD_ROOT,
@@ -181,6 +193,8 @@ def main():
     )
     x_train = datasets["disp_train"]
     x_val = datasets["disp_val"]
+    imu_train = datasets["imu_train"]
+    imu_val = datasets["imu_val"]
     if x_train.shape[0] == 0 or x_val.shape[0] == 0:
         raise RuntimeError(f"No displacement truth windows found for DATASET={dataset_name}")
 
@@ -188,20 +202,27 @@ def main():
     x_train_norm = normalize_truth(x_train, mean_np, std_np).astype(np.float32)
     x_val_norm = normalize_truth(x_val, mean_np, std_np).astype(np.float32)
 
-    print(f"Disp truth windows: train={x_train.shape[0]} val={x_val.shape[0]} shape={x_train.shape[1:]}")
+    print(
+        f"Disp truth windows: train={x_train.shape[0]} val={x_val.shape[0]} "
+        f"shape={x_train.shape[1:]} imu_condition={imu_condition_mode}"
+    )
     print(f"disp mean={mean_np.reshape(-1)} std={std_np.reshape(-1)}")
 
-    model = TruthAutoEncoder(**model_config()).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    train_loader = make_loader(x_train_norm, shuffle=True)
-    val_loader = make_loader(x_val_norm, shuffle=False)
-
+    resume_state = None
     if mode in {"load", "resume"} and os.path.exists(ckpt_path):
-        state = load_torch_checkpoint(ckpt_path, map_location=device)
-        model.load_state_dict(state["model_state_dict"])
-        print(f"Loaded checkpoint: {ckpt_path}")
+        resume_state = load_torch_checkpoint(ckpt_path, map_location=device)
     elif mode == "load":
         raise FileNotFoundError(f"MODE=load requested but checkpoint not found: {ckpt_path}")
+
+    model_cfg = model_config() if resume_state is None else resume_state["model_config"]
+    model = TruthAutoEncoder(**model_cfg).to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    train_loader = make_loader(x_train_norm, imu_train, shuffle=True)
+    val_loader = make_loader(x_val_norm, imu_val, shuffle=False)
+
+    if resume_state is not None:
+        model.load_state_dict(resume_state["model_state_dict"])
+        print(f"Loaded checkpoint: {ckpt_path}")
 
     metrics = evaluate(model, val_loader, mean_np, std_np)
     print(
@@ -209,7 +230,7 @@ def main():
         f"endpoint_rmse={metrics['endpoint_rmse']:.4f}m path_len_mae={metrics['path_len_mae']:.4f}m"
     )
     if mode == "load":
-        plot_examples(model, x_val_norm, mean_np, std_np, output_dir)
+        plot_examples(model, x_val_norm, imu_val, mean_np, std_np, output_dir)
         return
 
     best_loss = float("inf")
@@ -218,9 +239,10 @@ def main():
         model.train()
         total = 0.0
         count = 0
-        for (xb,) in train_loader:
+        for xb, ib in train_loader:
             xb = xb.to(device)
-            recon, latent = model(xb)
+            ib = ib.to(device)
+            recon, latent = model(xb, imu_seq=ib)
             loss_recon = F.smooth_l1_loss(recon, xb)
             loss_latent = 1e-4 * torch.mean(latent * latent)
             loss = loss_recon + loss_latent
@@ -249,7 +271,7 @@ def main():
     best_state = load_torch_checkpoint(ckpt_path, map_location=device)
     model.load_state_dict(best_state["model_state_dict"])
     final_metrics = evaluate(model, val_loader, mean_np, std_np)
-    plot_examples(model, x_val_norm, mean_np, std_np, output_dir)
+    plot_examples(model, x_val_norm, imu_val, mean_np, std_np, output_dir)
 
     metrics_path = os.path.join(output_dir, "metrics.json")
     with open(metrics_path, "w") as f:

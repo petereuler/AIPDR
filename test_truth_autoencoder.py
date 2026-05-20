@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-from data.dense_truth import load_dense_truth_dataset
+from data.dense_truth import load_dense_truth_imu_dataset
 from models.truth_autoencoder import TruthAutoEncoder
 
 
@@ -71,9 +71,15 @@ def path_length(seq):
     return np.sum(np.linalg.norm(steps, axis=2), axis=1)
 
 
-def make_loader(x):
-    tensor = torch.tensor(x, dtype=torch.float32)
-    return DataLoader(TensorDataset(tensor), batch_size=batch_size, shuffle=False)
+def make_loader(x_truth, x_imu):
+    return DataLoader(
+        TensorDataset(
+            torch.tensor(x_truth, dtype=torch.float32),
+            torch.tensor(x_imu, dtype=torch.float32),
+        ),
+        batch_size=batch_size,
+        shuffle=False,
+    )
 
 
 def run_inference(model, loader, mean_np, std_np):
@@ -83,9 +89,10 @@ def run_inference(model, loader, mean_np, std_np):
     gt_rows = []
     latent_rows = []
     with torch.no_grad():
-        for (xb,) in loader:
+        for xb, ib in loader:
             xb = xb.to(device)
-            recon, latent = model(xb)
+            ib = ib.to(device)
+            recon, latent = model(xb, imu_seq=ib)
             loss = F.smooth_l1_loss(recon, xb)
             losses.append(float(loss.item()) * xb.size(0))
             pred_rows.append(unnormalize_truth(recon.cpu().numpy(), mean_np, std_np))
@@ -164,7 +171,7 @@ def main():
     ckpt_window_size = int(state.get("window_size", window_size))
     ckpt_stride = int(state.get("stride", stride))
 
-    _x_train, x_val, _train_sequences, _val_sequences = load_dense_truth_dataset(
+    datasets = load_dense_truth_imu_dataset(
         dataset_name,
         RIDI_ROOT,
         OXIOD_ROOT,
@@ -173,11 +180,13 @@ def main():
         start_offset=0,
         truth_mode=truth_mode,
     )
+    x_val = datasets["truth_val"]
+    imu_val = datasets["imu_val"]
     if x_val.shape[0] == 0:
         raise RuntimeError(f"No validation windows found for DATASET={dataset_name}, truth_mode={truth_mode}")
 
     x_val_norm = normalize_truth(x_val, mean_np, std_np).astype(np.float32)
-    pred, gt, latent, metrics = run_inference(model, make_loader(x_val_norm), mean_np, std_np)
+    pred, gt, latent, metrics = run_inference(model, make_loader(x_val_norm, imu_val), mean_np, std_np)
 
     print(
         f"Val windows={x_val.shape[0]} loss={metrics['loss']:.6f} "

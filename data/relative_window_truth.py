@@ -312,10 +312,14 @@ def _load_pose_imu_sequences_from_oxiod(pairs, window_size=64, stride=64, start_
     return sequences
 
 
-def concatenate_sequence_truth(sequences, window_size, feat_dim):
+def concatenate_sequence_field(sequences, field, window_size, feat_dim):
     if not sequences:
         return np.zeros((0, window_size, feat_dim), dtype=np.float32)
-    return np.concatenate([seq["truth"] for seq in sequences], axis=0).astype(np.float32)
+    return np.concatenate([seq[field] for seq in sequences], axis=0).astype(np.float32)
+
+
+def concatenate_sequence_truth(sequences, window_size, feat_dim):
+    return concatenate_sequence_field(sequences, "truth", window_size, feat_dim)
 
 
 def concatenate_sequence_imu(sequences, window_size):
@@ -392,8 +396,10 @@ def load_pose_imu_relative_datasets(dataset_name, ridi_root, oxiod_root, window_
     return {
         "imu_train": concatenate_sequence_imu(train_sequences, window_size),
         "imu_val": concatenate_sequence_imu(val_sequences, window_size),
-        "pose_train": concatenate_sequence_truth(train_sequences, window_size, 4),
-        "pose_val": concatenate_sequence_truth(val_sequences, window_size, 4),
+        "pose_train": concatenate_sequence_field(train_sequences, "truth", window_size, 4),
+        "pose_val": concatenate_sequence_field(val_sequences, "truth", window_size, 4),
+        "disp_train": concatenate_sequence_field(train_sequences, "disp", window_size, 3),
+        "disp_val": concatenate_sequence_field(val_sequences, "disp", window_size, 3),
         "train_sequences": train_sequences,
         "val_sequences": val_sequences,
     }

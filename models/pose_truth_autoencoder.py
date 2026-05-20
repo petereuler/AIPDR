@@ -19,6 +19,8 @@ class PoseTruthAutoEncoder(TruthAutoEncoder):
         num_layers=2,
         dim_feedforward=256,
         dropout=0.1,
+        condition_mode="none",
+        imu_dim=6,
     ):
         super().__init__(
             input_dim=4,
@@ -29,15 +31,18 @@ class PoseTruthAutoEncoder(TruthAutoEncoder):
             num_layers=num_layers,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
+            condition_mode=condition_mode,
+            imu_dim=imu_dim,
         )
 
-    def decode(self, latent):
-        return quat_normalize_torch(super().decode(latent))
+    def decode(self, latent, imu_seq=None, condition_feat=None):
+        return quat_normalize_torch(super().decode(latent, imu_seq=imu_seq, condition_feat=condition_feat))
 
-    def forward(self, truth_seq):
+    def forward(self, truth_seq, imu_seq=None):
         truth_seq = quat_normalize_torch(truth_seq)
-        latent = self.encode(truth_seq)
-        recon = self.decode(latent)
+        cond = self._resolve_condition(imu_seq=imu_seq) if self.use_imu_condition else None
+        latent = self.encode(truth_seq, condition_feat=cond)
+        recon = self.decode(latent, condition_feat=cond)
         return recon, latent
 
 

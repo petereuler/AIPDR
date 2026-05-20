@@ -73,6 +73,48 @@ def dense_truth_windows(
     return np.asarray(windows, dtype=np.float32)
 
 
+def dense_truth_imu_windows(
+    gyro_data,
+    acc_data,
+    pos_data,
+    ori_data,
+    window_size=64,
+    stride=64,
+    start_offset=0,
+    truth_mode="rel_pos_body",
+):
+    m = min(gyro_data.shape[0], acc_data.shape[0], pos_data.shape[0], ori_data.shape[0])
+    gyro_data = gyro_data[:m]
+    acc_data = acc_data[:m]
+    pos_data = pos_data[:m]
+    ori_data = ori_data[:m]
+
+    truth_windows = []
+    imu_windows = []
+    max_start = gyro_data.shape[0] - window_size - 1
+    start_offset = int(max(0, start_offset))
+    for idx in range(start_offset, max_start, stride):
+        start = idx + 1
+        end = start + window_size
+        gyro_window = gyro_data[start:end]
+        acc_window = acc_data[start:end]
+        pos_window = pos_data[start:end]
+        ori_window = ori_data[start:end]
+        if (
+            gyro_window.shape[0] != window_size
+            or acc_window.shape[0] != window_size
+            or pos_window.shape[0] != window_size
+            or ori_window.shape[0] != window_size
+        ):
+            continue
+        truth_windows.append(_build_truth_window(pos_window, ori_window, truth_mode))
+        imu_windows.append(np.concatenate([gyro_window, acc_window], axis=-1).astype(np.float32))
+
+    if not truth_windows:
+        return np.zeros((0, window_size, 3), dtype=np.float32), np.zeros((0, window_size, 6), dtype=np.float32)
+    return np.asarray(truth_windows, dtype=np.float32), np.asarray(imu_windows, dtype=np.float32)
+
+
 def load_ridi_dense_truth_sequences(
     ridi_root,
     names,
@@ -102,6 +144,37 @@ def load_ridi_dense_truth_sequences(
     return sequences
 
 
+def load_ridi_dense_truth_imu_sequences(
+    ridi_root,
+    names,
+    window_size=64,
+    stride=64,
+    start_offset=0,
+    truth_mode="rel_pos_body",
+    imu_acc_source="acce",
+):
+    data_root = os.path.join(ridi_root, "data")
+    sequences = []
+    for name in names:
+        seq_dir = os.path.join(data_root, name)
+        if not os.path.isdir(seq_dir):
+            continue
+        gyro, acc, pos_xyz, ori = load_ridi_raw(seq_dir, acc_source=imu_acc_source)
+        truth, imu = dense_truth_imu_windows(
+            gyro,
+            acc,
+            pos_xyz,
+            ori,
+            window_size=window_size,
+            stride=stride,
+            start_offset=start_offset,
+            truth_mode=truth_mode,
+        )
+        if truth.shape[0] > 0:
+            sequences.append({"name": name, "truth": truth, "imu": imu})
+    return sequences
+
+
 def load_oxiod_dense_truth_sequences(
     pairs,
     window_size=64,
@@ -126,10 +199,41 @@ def load_oxiod_dense_truth_sequences(
     return sequences
 
 
+def load_oxiod_dense_truth_imu_sequences(
+    pairs,
+    window_size=64,
+    stride=64,
+    start_offset=0,
+    truth_mode="rel_pos_body",
+):
+    sequences = []
+    for name, imu_file, gt_file in pairs:
+        gyro, acc, pos_xyz, ori = load_oxiod_raw(imu_file, gt_file)
+        truth, imu = dense_truth_imu_windows(
+            gyro,
+            acc,
+            pos_xyz,
+            ori,
+            window_size=window_size,
+            stride=stride,
+            start_offset=start_offset,
+            truth_mode=truth_mode,
+        )
+        if truth.shape[0] > 0:
+            sequences.append({"name": name, "truth": truth, "imu": imu})
+    return sequences
+
+
 def concatenate_truth(sequences, window_size=64):
     if not sequences:
         return np.zeros((0, window_size, 3), dtype=np.float32)
     return np.concatenate([seq["truth"] for seq in sequences], axis=0).astype(np.float32)
+
+
+def concatenate_imu(sequences, window_size=64):
+    if not sequences:
+        return np.zeros((0, window_size, 6), dtype=np.float32)
+    return np.concatenate([seq["imu"] for seq in sequences], axis=0).astype(np.float32)
 
 
 def load_dense_truth_dataset(
@@ -188,3 +292,66 @@ def load_dense_truth_dataset(
         train_sequences,
         val_sequences,
     )
+
+
+def load_dense_truth_imu_dataset(
+    dataset_name,
+    ridi_root,
+    oxiod_root,
+    window_size=64,
+    stride=64,
+    start_offset=0,
+    truth_mode="rel_pos_body",
+    imu_acc_source="acce",
+):
+    dataset_name = dataset_name.upper()
+    if dataset_name == "RIDI":
+        data_root = os.path.join(ridi_root, "data")
+        train_names = _read_name_list(os.path.join(data_root, "list_train_publish_v2.txt"))
+        val_names = _read_name_list(os.path.join(data_root, "list_test_publish_v2.txt"))
+        train_sequences = load_ridi_dense_truth_imu_sequences(
+            ridi_root,
+            train_names,
+            window_size=window_size,
+            stride=stride,
+            start_offset=start_offset,
+            truth_mode=truth_mode,
+            imu_acc_source=imu_acc_source,
+        )
+        val_sequences = load_ridi_dense_truth_imu_sequences(
+            ridi_root,
+            val_names,
+            window_size=window_size,
+            stride=stride,
+            start_offset=start_offset,
+            truth_mode=truth_mode,
+            imu_acc_source=imu_acc_source,
+        )
+    elif dataset_name == "OXIOD":
+        train_pairs = get_oxiod_predefined_split_pairs(oxiod_root, split="train", sensor="syn")
+        val_pairs = get_oxiod_predefined_split_pairs(oxiod_root, split="test", sensor="syn")
+        train_sequences = load_oxiod_dense_truth_imu_sequences(
+            train_pairs,
+            window_size=window_size,
+            stride=stride,
+            start_offset=start_offset,
+            truth_mode=truth_mode,
+        )
+        val_sequences = load_oxiod_dense_truth_imu_sequences(
+            val_pairs,
+            window_size=window_size,
+            stride=stride,
+            start_offset=start_offset,
+            truth_mode=truth_mode,
+        )
+    else:
+        raise ValueError(f"Unsupported DATASET={dataset_name}, expected RIDI or OXIOD")
+
+    return {
+        "truth_train": concatenate_truth(train_sequences, window_size=window_size),
+        "truth_val": concatenate_truth(val_sequences, window_size=window_size),
+        "imu_train": concatenate_imu(train_sequences, window_size=window_size),
+        "imu_val": concatenate_imu(val_sequences, window_size=window_size),
+        "train_sequences": train_sequences,
+        "val_sequences": val_sequences,
+    }

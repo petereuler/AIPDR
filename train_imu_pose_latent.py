@@ -216,8 +216,8 @@ def evaluate(predictor, autoencoder, loader):
             xb_imu = xb_imu.to(device)
             yb_pose = yb_pose.to(device)
             z_pred = predictor(xb_imu)
-            z_gt = autoencoder.encode(yb_pose)
-            q_pred = autoencoder.decode(z_pred)
+            z_gt = autoencoder.encode(yb_pose, imu_seq=xb_imu)
+            q_pred = autoencoder.decode(z_pred, imu_seq=xb_imu)
             loss_latent = torch.nn.functional.smooth_l1_loss(z_pred, z_gt)
             loss_pose = quaternion_sequence_loss(q_pred, yb_pose)
             loss = loss_latent + loss_pose
@@ -252,8 +252,10 @@ def evaluate_sequence_stage(predictor, autoencoder, loader):
             xb_imu_flat = xb_imu.reshape(bsz * num_seq, window_size_local, -1)
             yb_pose_flat = yb_pose.reshape(bsz * num_seq, window_size_local, -1)
             z_pred = predictor(xb_imu_flat).reshape(bsz, num_seq, -1)
-            z_gt = autoencoder.encode(yb_pose_flat).reshape(bsz, num_seq, -1)
-            q_pred = autoencoder.decode(z_pred.reshape(bsz * num_seq, -1)).reshape(bsz, num_seq, window_size_local, -1)
+            z_gt = autoencoder.encode(yb_pose_flat, imu_seq=xb_imu_flat).reshape(bsz, num_seq, -1)
+            q_pred = autoencoder.decode(z_pred.reshape(bsz * num_seq, -1), imu_seq=xb_imu_flat).reshape(
+                bsz, num_seq, window_size_local, -1
+            )
             pred_traj = rollout_sequence_xy_torch(step_disp, q_pred, init_rot)
 
             loss_latent = F.smooth_l1_loss(z_pred, z_gt)
@@ -351,9 +353,9 @@ def main():
             xb_imu = xb_imu.to(device)
             yb_pose = yb_pose.to(device)
             with torch.no_grad():
-                z_gt = autoencoder.encode(yb_pose)
+                z_gt = autoencoder.encode(yb_pose, imu_seq=xb_imu)
             z_pred = predictor(xb_imu)
-            q_pred = autoencoder.decode(z_pred)
+            q_pred = autoencoder.decode(z_pred, imu_seq=xb_imu)
             loss_latent = torch.nn.functional.smooth_l1_loss(z_pred, z_gt)
             loss_pose = quaternion_sequence_loss(q_pred, yb_pose)
             loss = loss_latent + loss_pose
@@ -432,9 +434,9 @@ def main():
                 xb_imu_flat = xb_imu.reshape(bsz * num_seq, window_size_local, -1)
                 yb_pose_flat = yb_pose.reshape(bsz * num_seq, window_size_local, -1)
                 with torch.no_grad():
-                    z_gt = autoencoder.encode(yb_pose_flat).reshape(bsz, num_seq, -1)
+                    z_gt = autoencoder.encode(yb_pose_flat, imu_seq=xb_imu_flat).reshape(bsz, num_seq, -1)
                 z_pred = predictor(xb_imu_flat).reshape(bsz, num_seq, -1)
-                q_pred = autoencoder.decode(z_pred.reshape(bsz * num_seq, -1)).reshape(
+                q_pred = autoencoder.decode(z_pred.reshape(bsz * num_seq, -1), imu_seq=xb_imu_flat).reshape(
                     bsz, num_seq, window_size_local, -1
                 )
                 pred_traj = rollout_sequence_xy_torch(step_disp, q_pred, init_rot)
